@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.o
+*.json
+badapple
+badapple_c
