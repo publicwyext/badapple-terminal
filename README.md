@@ -30,3 +30,26 @@ gcc -O2 -march=native badapple.c blob.o -o badapple -lm -lpthread
 ## Pipeline notes
 
 Frames flow through a 64-slot ring. Workers wait on per-slot sequence numbers; the main thread consumes in order against a monotonic clock (no frame-rate avalanche). On resize, stale-size frames are dropped by advancing the read cursor to the job cursor — nothing half-rendered ever reaches the terminal.
+
+## Regenerate the blob from any video
+
+The committed `badapple_blob.bin` was produced from *Bad Apple!! (60p)* — but the pipeline eats any black-and-white-ish video:
+
+```sh
+# 1) video -> per-frame closed contours, Fourier-truncated to k in [-24, 24]
+python3 encode_planb.py badapple.mp4 badapple.json
+
+# 2) JSON -> packed binary blob
+python3 make_blob.py badapple.json badapple_blob.bin
+
+# 3) embed & build
+ld -r -b binary -o blob.o badapple_blob.bin
+gcc -O2 -march=native badapple.c blob.o -o badapple -lm -lpthread
+```
+
+How it works: ffmpeg pumps raw gray frames → Otsu threshold → **pixel-crack contour tracing** (closed loops, saddle-point safe) → arc-length resampling to 256 points → `np.fft` truncated to 49 harmonics per contour. Playback resynthesizes each outline with `z(t) = Σ c_k e^{2πikt}` — that's the epicycle.
+
+`fourier_badapple.py` is an older, pure-Python player that reads the JSON directly (with `--circles` to show the rotating epicycle chains instead of just the traced curve). Requires numpy; much slower than the C build.
+
+Repo files: `badapple.c` (renderer) · `badapple_blob.bin` (coefficients, ~7.4 MB) · `encode_planb.py` / `make_blob.py` (generation pipeline) · `fourier_badapple.py` (Python player).
+
