@@ -4,3 +4,5 @@ __pycache__/
 *.json
 badapple
 badapple_c
+badapple-aarch64
+badapple-thumb
