@@ -75,20 +75,48 @@ static inline Frame *frame_of(long fi) {
     return &cpool[cslot_of[c] - 1].fr[fi - c * CHUNKF];
 }
 
-/* ---------- 级数合成: 直角坐标直接累加 ---------- */
-static void decode(const Contour *ct, double *pts) {
-    int K = ct->k1 - ct->k0 + 1;
-    for (int s = 0; s < SAMPLES; s++) {
-        double t = (double)s / SAMPLES, ph;
-        double zr = ct->c[0], zi = ct->c[1];
-        for (int j = 1; j < K; j++) {
-            ph = 2.0 * M_PI * (ct->k0 + j) * t;
-            double cr = ct->c[2*j], ci = ct->c[2*j+1];
-            zr += cr * cos(ph) - ci * sin(ph);
-            zi += cr * sin(ph) + ci * cos(ph);
-        }
-        pts[2*s] = zr; pts[2*s+1] = zi;
+/* ---------- 级数合成: 预烤相位表, 内层纯 FMA 可向量化 ----------
+ * 相位 2*pi*h*s/SAMPLES 是 256 次单位根格点: e^{i2pihs/256} = W[(h*s)&255],
+ * W 只需 64 个独立值 + 象限镜像; 全表 CTab/STab[129][256] 由其展开, 约 264KB,
+ * 一次烤好后 decode 内层为顺序扫描的 FMA 循环, 无任何 libm 三角函数调用。 */
+static float CTab[129][SAMPLES], STab[129][SAMPLES];
+
+static void tables_init(void) {
+    static float Wc[SAMPLES], Ws[SAMPLES];
+    for (int m = 0; m < SAMPLES / 4; m++) {
+        double th = 2.0 * M_PI * m / SAMPLES;
+        Wc[m] = (float)cos(th); Ws[m] = (float)sin(th);
     }
+    for (int m = SAMPLES / 4; m < SAMPLES; m++) {
+        int q = m & (SAMPLES / 4 - 1);
+        switch (m >> 6) {
+        case 1: Wc[m] = -Ws[q]; Ws[m] =  Wc[q]; break;
+        case 2: Wc[m] = -Wc[q]; Ws[m] = -Ws[q]; break;
+        case 3: Wc[m] =  Ws[q]; Ws[m] = -Wc[q]; break;
+        }
+    }
+    for (int h = -64; h <= 64; h++)
+        for (int s = 0; s < SAMPLES; s++) {
+            int m = (h * s) & (SAMPLES - 1);
+            CTab[h + 64][s] = Wc[m];
+            STab[h + 64][s] = Ws[m];
+        }
+}
+
+/* h = k0+j 取值 [-64,63], 索引 h+64 ∈ [0,128] 恰好铺满全表 */
+static void decode(const Contour *ct, double *pts) {
+    float zr[SAMPLES], zi[SAMPLES];
+    for (int s = 0; s < SAMPLES; s++) zr[s] = ct->c[0], zi[s] = ct->c[1];
+    int K = ct->k1 - ct->k0 + 1;
+    for (int j = 1; j < K; j++) {
+        const float *cs = CTab[ct->k0 + j + 64], *sn = STab[ct->k0 + j + 64];
+        const float cr = ct->c[2 * j], ci = ct->c[2 * j + 1];
+        for (int s = 0; s < SAMPLES; s++) {
+            zr[s] += cr * cs[s] - ci * sn[s];
+            zi[s] += cr * sn[s] + ci * cs[s];
+        }
+    }
+    for (int s = 0; s < SAMPLES; s++) { pts[2 * s] = zr[s]; pts[2 * s + 1] = zi[s]; }
 }
 
 /* ---------- 光栅化 ---------- */
@@ -441,6 +469,7 @@ static void parse_blob(void) {
 }
 
 int main(int argc, char **argv) {
+    tables_init();
     int test_frame = -1, selftest = 0;
     double fps = 0;
     for (int i = 1; i < argc; i++) {

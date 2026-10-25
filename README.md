@@ -30,6 +30,7 @@ The one-liner runs the full pipeline — `encode_planb.py` (ffmpeg raw gray → 
 - **Differential ANSI rendering** — only changed cells are rewritten between frames, no full-screen repaints.
 - **SIGWINCH adaptive canvas** — debounced (150 ms) rebuild while dragging; workers swap generations and the pipeline drains cleanly.
 - **Pipelined pre-render** — N render workers bake frames ahead in strict order; the main thread only diffs cells and paces the beat.
+- **Tabulated series synthesis** — the epicycle sum touches zero libm trig calls: all `e^{2πihs/256}` phases are 256th roots of unity, pre-baked once from a 64-entry quadrant-folded table into a 129×256 cos/sin LUT (~264 KB); `decode()` reduces to sequential SIMD FMA loops. Full-feature playback 3.25 s → 0.39 s (8.3×, threads=4), pixel-identical output, cold start 11.5 → 8.6 ms.
 - **Chunked streaming decompression** — the BAP2 blob decodes lazily: D decoder threads claim chunks in order (bounded by a small slot pool), xz-inflate each independently, undo the frame-to-frame coefficient diffs, and publish decoded frames into the pipeline. Memory stays near the compressed size + a handful of chunk arenas.
 - Self-contained binary, plain `#` ASCII output — works over any dumb SSH session.
 
