@@ -34,6 +34,7 @@ extern const unsigned char _binary_badapple_blob_bin_end[];
 #define SAMPLES 256
 #define NSLOT 64
 #define BLK '#'
+static const char *g_fg = "\xe2\x96\x88";  /* █ 白块, --char 可换 */
 #define QSCALE (1.0 / 256.0)          /* BAP3: int16 定点, Q8 */
 #define MAXCOEF 98                    /* 2*(24+24+1) */
 #define NREF 255                      /* 差分参考槽, u8 槽号, 0xFF=绝对不占槽 */
@@ -177,7 +178,7 @@ static char *emit_buf = NULL;
 static size_t emit_cap = 0;
 
 static void emit_buf_reserve(void) {
-    size_t need = (size_t)H * (W + 32) + 64;
+    size_t need = (size_t)H * (W * 3 + 64) + 64;
     if (emit_cap < need) {
         free(emit_buf);
         emit_cap = need + need / 2;
@@ -207,6 +208,14 @@ static inline char *put_u(char *p, uint32_t v) {
     return p;
 }
 
+static inline char *put_cells(char *p, const unsigned char *s, uint32_t n) {
+    while (n--) {
+        if (*s == BLK) { for (const char *q = g_fg; *q; q++) *p++ = *q; s++; }
+        else *p++ = (char)*s++;
+    }
+    return p;
+}
+
 static void emit_frame(int fd, const unsigned char *cur) {
     char *p = emit_buf;
     if (!g_prev) {
@@ -215,8 +224,9 @@ static void emit_frame(int fd, const unsigned char *cur) {
         memset(g_prev, ' ', (size_t)H * (W + 1));
         memcpy(p, "\x1b[2J", 4); p += 4;
         for (uint32_t r = 0; r < H; r++) {
+            memcpy(p, "\x1b[", 2); p += 2;
             p = put_u(p, r + 1); *p++ = ';'; *p++ = '1'; *p++ = 'H';
-            memcpy(p, cur + (size_t)r * (W + 1), W); p += W;
+            p = put_cells(p, cur + (size_t)r * (W + 1), W);
         }
     } else {
         for (uint32_t r = 0; r < H; r++) {
@@ -235,9 +245,10 @@ static void emit_frame(int fd, const unsigned char *cur) {
                     if (c < W && c - gap0 < MERGE_GAP) continue;  /* 小间隙并入前段 */
                     break;
                 }
+                memcpy(p, "\x1b[", 2); p += 2;
                 p = put_u(p, r + 1); *p++ = ';';
                 p = put_u(p, c0 + 1); *p++ = 'H';
-                memcpy(p, b + c0, c1 - c0); p += c1 - c0;
+                p = put_cells(p, b + c0, c1 - c0);
             }
         }
     }
@@ -546,6 +557,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--threads") && i+1 < argc) NTHREAD = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dthreads") && i+1 < argc) NDEC = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cols") && i+1 < argc) cols_opt = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--char") && i+1 < argc) g_fg = argv[++i];
         else if (!strcmp(argv[i], "--test") && i+1 < argc) test_frame = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--selftest")) selftest = 1;
     }
@@ -606,7 +618,7 @@ int main(int argc, char **argv) {
 
     /* --test: 同步解目标块, 渲一帧即走 */
     if (test_frame >= 0) {
-        long bfi = 0, bd = 1L << 60;
+        long bfi = 0, bd = TOTAL;
         for (long s = 0; s < n_sel; s++) {
             long fi = n_sel > 1 ? s * (TOTAL - 1) / (n_sel - 1) : 0;
             long d = fi > test_frame ? fi - test_frame : test_frame - fi;
@@ -637,7 +649,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < NDEC; i++) pthread_create(&dth[i], NULL, decoder, NULL);
 
     int fd = 1;
-    full_write(fd, "\x1b[?25l\x1b[2J", 7);
+    full_write(fd, "\x1b[?25l\x1b[2J", 10);
     unsigned char *tick = NULL;
 
     if (!g_inline) {
