@@ -2,23 +2,18 @@
 
 **Bad Apple!!** in your terminal — outlines re-synthesized by truncated **Fourier series (epicycles)**, rasterized and played by a tiny C renderer with **zero runtime dependencies**.
 
-The coefficient payload ships as a **BAP2 container (~1.3 MB)**: coefficients quantized to int16 fixed-point (Q8), **inter-frame differenced**, split into 55 independent chunks and each compressed with **xz**. Linked straight into the ELF via `ld -r -b binary` — no file I/O, no parsing at startup. A pool of **multicore streaming decoder threads** (vendored **XZ Embedded**, 0BSD) inflates chunks ahead of the render pipeline, so cold start → first frame stays **~17 ms**.
+**Bring your own video**: any mp4 you feed the pipeline becomes your own epicycle blob. Coefficients ship as a **BAP2 container**: quantized to int16 fixed-point (Q8), **inter-frame differenced**, split into independent chunks, each compressed with **xz**. Linked straight into the ELF via `ld -r -b binary` — no file I/O, no parsing at startup. A pool of **multicore streaming decoder threads** (vendored **XZ Embedded**, 0BSD) inflates chunks ahead of the render pipeline, so cold start → first frame stays **~17 ms**.
 
 ## Build
 
-```sh
-make            # -O3 -flto + --gc-sections + strip
-```
-
-or by hand:
+Requires: `gcc`, `python3` + `numpy`, `ffmpeg` in PATH.
 
 ```sh
-ld -r -b binary -o blob.o badapple_blob.bin
-gcc -O3 -march=native -flto -fno-plt -fomit-frame-pointer -ffunction-sections -fdata-sections badapple.c xz_embedded/*.c blob.o -o badapple -lm -lpthread -Wl,--gc-sections,--build-id=none
-strip --strip-all -R .comment -R .note -R .note.gnu.build-id badapple
+make gen VIDEO=my.mp4    # video -> contours -> BAP2 blob -> link & compile
+make                     # rebuild later without re-encoding
 ```
 
-Note: ~95% of the binary is the already-xz-compressed blob; do NOT UPX-pack the final binary — it saves ~47 KB but doubles startup (11.3 ms → 20.8 ms measured).
+The one-liner runs the full pipeline — `encode_planb.py` (ffmpeg raw gray → Otsu → pixel-crack contour tracing → arc-length resample → FFT truncated to k ∈ [-24, 24]) then `make_blob.py` (quantize + inter-frame diff + chunked xz, decoder-mirror self-verified) — then embeds the blob and builds with `-O3 -flto + --gc-sections + strip`.
 
 ## Usage
 
@@ -56,20 +51,25 @@ Per frame: `u16 (cnt | 0x8000=KEY)`, then per contour: `u8 (k0+64 | 0x80=ABS) u8
 
 `make_blob.py` verifies every chunk by running a decoder mirror over the emitted bytes and asserting value-exact reconstruction before writing anything.
 
-## Regenerate the blob from any video
+## Regenerate the blob, step by step
+
+`make gen VIDEO=my.mp4` already does all of this; the manual path, if you want to poke at intermediate artifacts:
 
 ```sh
 # 1) video -> per-frame closed contours, Fourier-truncated to k in [-24, 24]
-python3 encode_planb.py badapple.mp4 badapple.json
+python3 encode_planb.py my.mp4 badapple.json
 
 # 2) JSON -> BAP2 (quantize + diff + chunked xz, self-verified)
 python3 make_blob.py badapple.json badapple_blob.bin
 
-# 3) embed & build
+# 3) embed & build (or just: make)
 ld -r -b binary -o blob.o badapple_blob.bin
-gcc -O2 -march=native badapple.c xz_embedded/*.c blob.o -o badapple -lm -lpthread
+gcc -O3 -march=native -flto -fno-plt -fomit-frame-pointer -ffunction-sections -fdata-sections badapple.c xz_embedded/*.c blob.o -o badapple -lm -lpthread -Wl,--gc-sections,--build-id=none
+strip --strip-all -R .comment -R .note -R .note.gnu.build-id badapple
 ```
+
+Note: ~95% of the binary is the already-xz-compressed blob; do NOT UPX-pack the final binary — it saves ~47 KB but doubles startup (11.3 ms → 20.8 ms measured).
 
 How it works: ffmpeg pumps raw gray frames → Otsu threshold → **pixel-crack contour tracing** (closed loops, saddle-point safe) → arc-length resampling to 256 points → `np.fft` truncated to 49 harmonics per contour. Playback resynthesizes each outline with `z(t) = Σ c_k e^{2πikt}` — that's the epicycle.
 
-Repo files: `badapple.c` (renderer + streaming decoder) · `badapple_blob.bin` (BAP2, ~1.3 MB) · `encode_planb.py` / `make_blob.py` (generation pipeline) · `xz_embedded/` (vendored XZ Embedded, 0BSD).
+Repo files: `badapple.c` (renderer + streaming decoder) · `encode_planb.py` / `make_blob.py` (generation pipeline) · `Makefile` (BYO video one-liner) · `xz_embedded/` (vendored XZ Embedded, 0BSD). No pre-baked blob ships here — encode your own.
