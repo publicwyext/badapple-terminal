@@ -483,6 +483,7 @@ static void on_sigint(int s) { (void)s; g_stop = 1; }
 static void on_sigwinch(int s) { (void)s; g_resize = 1; }
 
 static int cols_opt = 0;
+static double cell_opt = 2.0;      /* 字符格 宽/高 比, --cell 覆盖 (等宽字体典型 0.4~0.6) */
 static void setup_canvas(void) {
     int cols = cols_opt;
     if (!cols) {
@@ -491,15 +492,15 @@ static void setup_canvas(void) {
         cols = 100;
         if (term > 1 && cols > term - 1) cols = term - 1;
     }
-    W = (uint32_t)(2.0 * W0) < (uint32_t)cols ? 2 * W0 : (uint32_t)cols;
-    H = (uint32_t)lround((double)W * H0 / (2.0 * W0));
+    W = (uint32_t)(cell_opt * W0) < (uint32_t)cols ? (uint32_t)(cell_opt * W0) : (uint32_t)cols;
+    H = (uint32_t)lround((double)W * H0 / (cell_opt * W0));
     if (H < 8) H = 8;
     {
         struct winsize ws;
         int rows = (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 4) ? ws.ws_row : 30;
         if ((int)H > rows - 3) {
             H = rows - 3;
-            uint32_t w2 = (uint32_t)lround(2.0 * H * W0 / (double)H0);
+            uint32_t w2 = (uint32_t)lround(cell_opt * H * W0 / (double)H0);
             if (w2 < W) W = w2;
         }
     }
@@ -548,6 +549,8 @@ int main(int argc, char **argv) {
                 "  --threads N   预烤线程数, 默认自动 (画布 >= %d 列才开, 否则内联); 1=强制内联\n"
                 "  --dthreads N  解压线程数, 默认 4\n"
                 "  --cols C      画布列数, 默认 100 (超出终端宽自动收窄)\n"
+                "  --cell R      字符格宽/高比, 默认 2.0 (按终端字体微调画幅比例)\n"
+                "  --char S      墨点字符, 默认 █ (纯 ASCII 环境可用 '#')\n"
                 "  --test K      渲染离第 K 帧最近的选中帧后退出\n"
                 "  --selftest    全块串行解压并输出校验和后退出\n"
                 "  -h, --help    显示本帮助\n", WORKER_COLS);
@@ -557,7 +560,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--threads") && i+1 < argc) NTHREAD = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--dthreads") && i+1 < argc) NDEC = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cols") && i+1 < argc) cols_opt = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--cell") && i+1 < argc) cell_opt = atof(argv[++i]);
         else if (!strcmp(argv[i], "--char") && i+1 < argc) g_fg = argv[++i];
+
         else if (!strcmp(argv[i], "--test") && i+1 < argc) test_frame = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--selftest")) selftest = 1;
     }

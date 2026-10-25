@@ -148,9 +148,16 @@ def undiff(chunk):
     return frames
 
 
-def make_blob(in_json, out_bin):
+def make_blob(in_json, out_bin, sy=1.0):
     d = json.load(open(in_json))
     frames = d['frames']
+    if sy != 1.0:   # y 仿射: c'_k = Re(c_k) + i*sy*Im(c_k); 域高同步缩放 (DFT 线性性, 逐值无损)
+        for f in frames:
+            for c in f['f']:
+                arr = np.asarray(c['c'], dtype=np.float64).reshape(-1)
+                arr[1::2] *= sy
+                c['c'] = arr.reshape(-1, 2).tolist()
+        d['h'] = round(d['h'] * sy)
     total = len(frames)
     quants = []
     for f in frames:
@@ -204,5 +211,11 @@ def make_blob(in_json, out_bin):
 
 
 if __name__ == '__main__':
-    make_blob(sys.argv[1] if len(sys.argv) > 1 else 'badapple.json',
-              sys.argv[2] if len(sys.argv) > 2 else 'badapple_blob.bin')
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument('in_json', nargs='?', default='badapple.json')
+    ap.add_argument('out_bin', nargs='?', default='badapple_blob.bin')
+    ap.add_argument('--sy', type=float, default=1.0,
+                    help='y 轴仿射拉伸 (修纵横比: 480x360 被 scale=96:48 压扁时用 1.5)')
+    a = ap.parse_args()
+    make_blob(a.in_json, a.out_bin, sy=a.sy)
