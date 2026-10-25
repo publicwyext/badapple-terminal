@@ -2,52 +2,65 @@
 
 **Bad Apple!!** in your terminal — outlines re-synthesized by truncated **Fourier series (epicycles)**, rasterized and played by a tiny C renderer with **zero runtime dependencies**.
 
-The coefficient blob (~7.4 MB) is linked straight into the ELF via `ld -r -b binary` — no parsing, no file I/O at startup. Cold start → first frame: **~17 ms**.
+The coefficient payload ships as a **BAP2 container (~1.3 MB)**: coefficients quantized to int16 fixed-point (Q8), **inter-frame differenced**, split into 55 independent chunks and each compressed with **xz**. Linked straight into the ELF via `ld -r -b binary` — no file I/O, no parsing at startup. A pool of **multicore streaming decoder threads** (vendored **XZ Embedded**, 0BSD) inflates chunks ahead of the render pipeline, so cold start → first frame stays **~17 ms**.
 
 ## Build
 
 ```sh
 ld -r -b binary -o blob.o badapple_blob.bin
-gcc -O2 -march=native badapple.c blob.o -o badapple -lm -lpthread
+gcc -O2 -march=native badapple.c xz_embedded/*.c blob.o -o badapple -lm -lpthread
 ```
 
 ## Usage
 
 ```sh
-./badapple             # play (30 fps, auto-fit to your window)
-./badapple --fps 60 --threads 8
-./badapple --cols 120  # force canvas width
-./badapple --test 500  # render a single frame and exit
+./badapple                  # play (30 fps, auto-fit to your window)
+./badapple --fps 60 --threads 8 --dthreads 4
+./badapple --cols 120       # force canvas width
+./badapple --test 500       # render a single frame and exit
+./badapple --selftest       # decode all chunks serially, print checksum
 ```
 
 ## Features
 
-- **Differential ANSI rendering** — only changed cells are rewritten between frames (`ESC[row;colH` + incremental cells), no full-screen repaints.
+- **Differential ANSI rendering** — only changed cells are rewritten between frames, no full-screen repaints.
 - **SIGWINCH adaptive canvas** — debounced (150 ms) rebuild while dragging; workers swap generations and the pipeline drains cleanly.
-- **Pipelined pre-render** — N worker threads bake frames ahead in strict order; the main thread only diffs cells and paces the beat.
+- **Pipelined pre-render** — N render workers bake frames ahead in strict order; the main thread only diffs cells and paces the beat.
+- **Chunked streaming decompression** — the BAP2 blob decodes lazily: D decoder threads claim chunks in order (bounded by a small slot pool), xz-inflate each independently, undo the frame-to-frame coefficient diffs, and publish decoded frames into the pipeline. Memory stays near the compressed size + a handful of chunk arenas.
 - Self-contained binary, plain `#` ASCII output — works over any dumb SSH session.
 
 ## Pipeline notes
 
-Frames flow through a 64-slot ring. Workers wait on per-slot sequence numbers; the main thread consumes in order against a monotonic clock (no frame-rate avalanche). On resize, stale-size frames are dropped by advancing the read cursor to the job cursor — nothing half-rendered ever reaches the terminal.
+Frames flow through a 64-slot ring; chunks through a 6-slot decode pool. Decoder threads claim chunks **strictly in order and only while holding a free slot** (this pairing is what keeps an in-flight window contiguous and the pool deadlock-free); render workers wait on per-chunk readiness plus per-slot retirement. Slot retirement is judged **by lap** (`rd >= job - 63`), not by comparing stale slot markers — the marker-comparison form admits an out-of-order lap that stomps the marker the main thread is waiting on (a latent race the v1 renderer carried; it surfaced once decode threading changed the timing).
+
+On resize, stale-size frames are dropped by advancing the read cursor; chunks fully below the cursor are reclaimed, half-decoded stragglers are recycled on publish.
+
+## BAP2 container
+
+```
+'BAP2' u32 W H FPS TOTAL NCHUNK CHUNK_FRAMES
+NCHUNK × { u32 comp_off comp_len raw_len frame_first }   # comp_off from blob start
+NCHUNK independent xz streams (LZMA2, 2 MiB dict, CRC32) concatenated
+```
+
+Per frame: `u16 (cnt | 0x8000=KEY)`, then per contour: `u8 (k0+64 | 0x80=ABS) u8 (k1+64)` and int16 pairs. Chunks are self-contained (first frame is always KEY), so chunks decode in parallel and `--test` touches only the chunk it needs. Quantization is Q8 (×256): worst-case coefficient error ~0.02 px, an order of magnitude below the 0.54 px FFT-truncation error — measured raster drift vs the float32 build ≤ 0.24 % of cells on the worst frame.
+
+`make_blob.py` verifies every chunk by running a decoder mirror over the emitted bytes and asserting value-exact reconstruction before writing anything.
 
 ## Regenerate the blob from any video
-
-The committed `badapple_blob.bin` was produced from *Bad Apple!! (60p)* — but the pipeline eats any black-and-white-ish video:
 
 ```sh
 # 1) video -> per-frame closed contours, Fourier-truncated to k in [-24, 24]
 python3 encode_planb.py badapple.mp4 badapple.json
 
-# 2) JSON -> packed binary blob
+# 2) JSON -> BAP2 (quantize + diff + chunked xz, self-verified)
 python3 make_blob.py badapple.json badapple_blob.bin
 
 # 3) embed & build
 ld -r -b binary -o blob.o badapple_blob.bin
-gcc -O2 -march=native badapple.c blob.o -o badapple -lm -lpthread
+gcc -O2 -march=native badapple.c xz_embedded/*.c blob.o -o badapple -lm -lpthread
 ```
 
 How it works: ffmpeg pumps raw gray frames → Otsu threshold → **pixel-crack contour tracing** (closed loops, saddle-point safe) → arc-length resampling to 256 points → `np.fft` truncated to 49 harmonics per contour. Playback resynthesizes each outline with `z(t) = Σ c_k e^{2πikt}` — that's the epicycle.
 
-Repo files: `badapple.c` (renderer) · `badapple_blob.bin` (coefficients, ~7.4 MB) · `encode_planb.py` / `make_blob.py` (generation pipeline).
-
+Repo files: `badapple.c` (renderer + streaming decoder) · `badapple_blob.bin` (BAP2, ~1.3 MB) · `encode_planb.py` / `make_blob.py` (generation pipeline) · `xz_embedded/` (vendored XZ Embedded, 0BSD).
