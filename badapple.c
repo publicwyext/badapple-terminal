@@ -1,5 +1,6 @@
 /* badapple.c — 傅里叶级数画笔, 终端播放 (C 重写·极致性能版)
- * 数据嵌入: BAP2 容器 (int16 量化 + 帧间差分 + 分块 xz) 由 ld -r -b binary 连入
+ * 数据嵌入: BAP3 容器 (int16 量化+稀疏化, 质心匹配槽位差分, 分块 xz/CHECK_NONE)
+ *           由 ld -r -b binary 连入
  * 解压: 内嵌 XZ Embedded (0BSD), 按块流式解码, 多核解码线程池, 块间零依赖可并行;
  *       refs/raw/xz 实例全部线程本地复用, 稳态解码零分配
  * 渲染: 只用 '#' (ASCII), 画布每格 1 字节
@@ -33,9 +34,9 @@ extern const unsigned char _binary_badapple_blob_bin_end[];
 #define SAMPLES 256
 #define NSLOT 64
 #define BLK '#'
-#define QSCALE (1.0 / 256.0)          /* BAP2: int16 定点, Q8 */
+#define QSCALE (1.0 / 256.0)          /* BAP3: int16 定点, Q8 */
 #define MAXCOEF 98                    /* 2*(24+24+1) */
-#define MAXCT 512                     /* 单帧轮廓数上限 */
+#define NREF 255                      /* 差分参考槽, u8 槽号, 0xFF=绝对不占槽 */
 #define NCSLOT 6                      /* 解码块槽位池 */
 #define MERGE_GAP 6                   /* 同行变化段间隔小于此格数则并入前段 */
 #define WORKER_COLS 240               /* 画布达到此宽度才默认启用预烤工人 */
@@ -245,8 +246,8 @@ static void emit_frame(int fd, const unsigned char *cur) {
     memcpy(g_prev, cur, (size_t)H * (W + 1));
 }
 
-/* ---------- BAP2: xz 解压 + 反差分 ---------- */
-typedef struct { int32_t v[MAXCOEF]; int k0, k1, valid; } RefSlot;
+/* ---------- BAP3: xz 解压 + 反差分 (质心匹配槽位参考, 稀疏化系数量化) ---------- */
+typedef struct { int32_t v[MAXCOEF]; int valid; } RefSlot;
 
 static uint32_t get_u32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 
@@ -270,8 +271,9 @@ static int undiff_chunk(const uint8_t *raw, size_t rlen, CSlot *cs, RefSlot *ref
         nframes++;
         nct += hdr & 0x7FFF;
         for (uint32_t k = 0; k < (uint32_t)(hdr & 0x7FFF); k++) {
+            if (pos + 3 > rlen) return -1;
             int k0 = (raw[pos] & 0x7F) - 64, k1 = raw[pos + 1] - 64;
-            pos += 2 + 2u * (uint32_t)(2 * (k1 - k0 + 1));
+            pos += 3 + 2u * (uint32_t)(2 * (k1 - k0 + 1));
         }
     }
     if (pos != rlen || nframes > CHUNKF) return -1;
@@ -280,39 +282,33 @@ static int undiff_chunk(const uint8_t *raw, size_t rlen, CSlot *cs, RefSlot *ref
     cs->ct = malloc(sizeof(Contour) * nct);
     cs->fc = malloc(sizeof(float) * nct * MAXCOEF);
     if (!cs->fr || !cs->ct || !cs->fc) return -1;
-    /* pass2: 反差分 -> float */
+    /* pass2: 反差分 -> float; 槽号即参考, 与帧内序号无关 */
     pos = 0; uint32_t fb = 0, cb = 0;
     for (uint32_t f = 0; f < nframes; f++) {
         uint16_t hdr; memcpy(&hdr, raw + pos, 2); pos += 2;
         if (hdr & 0x8000)
-            for (int s = 0; s < MAXCT; s++) refs[s].valid = 0;
+            for (int s = 0; s < NREF; s++) refs[s].valid = 0;
         int cnt = hdr & 0x7FFF;
         cs->fr[f].ct = &cs->ct[cb];
         cs->fr[f].nct = cnt;
         for (int j = 0; j < cnt; j++) {
             int k0 = (raw[pos] & 0x7F) - 64, k1 = raw[pos + 1] - 64;
-            int abs = raw[pos] & 0x80;
-            pos += 2;
+            uint8_t abs_flag = raw[pos] & 0x80;
+            uint8_t slot = raw[pos + 2];
+            pos += 3;
+            if (slot != 0xFF && slot >= NREF) return -1;
             int n = 2 * (k1 - k0 + 1);
-            RefSlot *rf = &refs[j];
+            RefSlot *rf = slot != 0xFF ? &refs[slot] : NULL;
+            int use_ref = rf && rf->valid && !abs_flag;
             float *out = &cs->fc[(size_t)cb * MAXCOEF];
-            if (abs || !rf->valid) {
-                for (int q = 0; q < n; q++) {
-                    int16_t r; memcpy(&r, raw + pos + 2*q, 2);
-                    rf->v[q] = r;
-                    out[q] = (float)(r * QSCALE);
-                }
-            } else {
-                for (int q = 0; q < n; q++) {
-                    int16_t r; memcpy(&r, raw + pos + 2*q, 2);
-                    int32_t v = rf->v[q] + r;
-                    rf->v[q] = v;
-                    out[q] = (float)(v * QSCALE);
-                }
+            for (int q = 0; q < n; q++) {
+                int16_t r; memcpy(&r, raw + pos + 2*q, 2);
+                int32_t v = use_ref ? rf->v[q] + r : r;
+                if (rf) rf->v[q] = v;
+                out[q] = (float)(v * QSCALE);
             }
-            rf->valid = 1; rf->k0 = k0; rf->k1 = k1;
-            (void)rf->k0; (void)rf->k1;
             pos += 2u * n;
+            if (rf) rf->valid = 1;
             cs->ct[cb].k0 = k0; cs->ct[cb].k1 = k1; cs->ct[cb].c = out;
             cb++;
         }
@@ -360,7 +356,7 @@ static void decode_chunk_body(long c, CSlot *cs) {
         fail = 1;
     } else {
         if (!t_refs) {
-            t_refs = calloc(MAXCT, sizeof(RefSlot));
+            t_refs = calloc(NREF, sizeof(RefSlot));
             if (!t_refs) fail = 1;
         }
         if (!fail && t_rawcap < g_chk[c].rlen) {
@@ -506,8 +502,8 @@ static void setup_canvas(void) {
 static void parse_blob(void) {
     g_blob = _binary_badapple_blob_bin_start;
     g_blob_len = (size_t)(_binary_badapple_blob_bin_end - _binary_badapple_blob_bin_start);
-    if (g_blob_len < 32 || memcmp(g_blob, "BAP2", 4)) {
-        fprintf(stderr, "badapple-c: blob is not BAP2\n");
+    if (g_blob_len < 32 || memcmp(g_blob, "BAP3", 4)) {
+        fprintf(stderr, "badapple-c: blob is not BAP3\n");
         exit(1);
     }
     W0 = get_u32(g_blob + 4);  H0 = get_u32(g_blob + 8);
@@ -571,7 +567,7 @@ int main(int argc, char **argv) {
 
     /* --selftest: 全块串行解压, 输出逐值校验和 */
     if (selftest) {
-        RefSlot *refs = calloc(MAXCT, sizeof(RefSlot));
+        RefSlot *refs = calloc(NREF, sizeof(RefSlot));
         CSlot cs = {0};
         struct xz_dec *dec = xz_dec_init(XZ_SINGLE, 0);
         uint8_t *raw = NULL; size_t rawcap = 0;
@@ -621,7 +617,7 @@ int main(int argc, char **argv) {
         cpool[0].state = 2; cpool[0].chunk = c;
         struct xz_dec *dec = xz_dec_init(XZ_SINGLE, 0);
         uint8_t *raw = malloc(g_chk[c].rlen);
-        RefSlot *refs = calloc(MAXCT, sizeof(RefSlot));
+        RefSlot *refs = calloc(NREF, sizeof(RefSlot));
         if (!raw || !refs || !dec || xz_chunk(&g_chk[c], raw, dec) != 0 ||
             undiff_chunk(raw, g_chk[c].rlen, &cpool[0], refs) != 0) {
             fprintf(stderr, "badapple-c: test chunk decode failed\n");

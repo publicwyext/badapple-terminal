@@ -2,14 +2,14 @@
 
 **Bad Apple!!** in your terminal — outlines re-synthesized by truncated **Fourier series (epicycles)**, rasterized and played by a tiny C renderer with **zero runtime dependencies**.
 
-**Bring your own video**: any mp4 you feed the pipeline becomes your own epicycle blob. Coefficients ship as a **BAP2 container**: quantized to int16 fixed-point (Q8), **inter-frame differenced**, split into independent chunks, each compressed with **xz**. Linked straight into the ELF via `ld -r -b binary` — no file I/O, no parsing at startup. A pool of **multicore streaming decoder threads** (vendored **XZ Embedded**, 0BSD) inflates chunks ahead of the render pipeline, so cold start → first frame stays **~17 ms**.
+**Bring your own video**: any mp4 you feed the pipeline becomes your own epicycle blob. Coefficients ship as a **BAP3 container**: quantized to int16 fixed-point (Q8) and sparsified (sub-0.125px harmonics zeroed), contours **matched frame-to-frame by centroid** and **phase-aligned** (start-point + orientation via FFT correlation) before slot-keyed differencing, split into independent chunks, each compressed with **xz** (data check NONE). Linked straight into the ELF via `ld -r -b binary` — no file I/O, no parsing at startup. A pool of **multicore streaming decoder threads** (vendored **XZ Embedded**, 0BSD) inflates chunks ahead of the render pipeline, so cold start → first frame stays **~17 ms**.
 
 ## Build
 
 Requires: `gcc`, `python3` + `numpy`, `ffmpeg` in PATH.
 
 ```sh
-make gen VIDEO=my.mp4    # video -> contours -> BAP2 blob -> link & compile
+make gen VIDEO=my.mp4    # video -> contours -> BAP3 blob -> link & compile
 make                     # rebuild later without re-encoding
 ```
 
@@ -31,7 +31,7 @@ The one-liner runs the full pipeline — `encode_planb.py` (ffmpeg raw gray → 
 - **SIGWINCH adaptive canvas** — debounced (150 ms) rebuild while dragging; workers swap generations and the pipeline drains cleanly.
 - **Pipelined pre-render** — N render workers bake frames ahead in strict order; the main thread only diffs cells and paces the beat.
 - **Tabulated series synthesis** — the epicycle sum touches zero libm trig calls: all `e^{2πihs/256}` phases are 256th roots of unity, pre-baked once from a 64-entry quadrant-folded table into a 129×256 cos/sin LUT (~264 KB); `decode()` reduces to sequential SIMD FMA loops. Full-feature playback 3.25 s → 0.39 s (8.3×, threads=4), pixel-identical output, cold start 11.5 → 8.6 ms.
-- **Chunked streaming decompression** — the BAP2 blob decodes lazily: D decoder threads claim chunks in order (bounded by a small slot pool), xz-inflate each independently, undo the frame-to-frame coefficient diffs, and publish decoded frames into the pipeline. Memory stays near the compressed size + a handful of chunk arenas.
+- **Chunked streaming decompression** — the BAP3 blob decodes lazily: D decoder threads claim chunks in order (bounded by a small slot pool), xz-inflate each independently, undo the frame-to-frame coefficient diffs, and publish decoded frames into the pipeline. Memory stays near the compressed size + a handful of chunk arenas.
 - Self-contained binary, plain `#` ASCII output — works over any dumb SSH session.
 
 ## Pipeline notes
@@ -40,15 +40,15 @@ Frames flow through a 64-slot ring; chunks through a 6-slot decode pool. Decoder
 
 On resize, stale-size frames are dropped by advancing the read cursor; chunks fully below the cursor are reclaimed, half-decoded stragglers are recycled on publish.
 
-## BAP2 container
+## BAP3 container
 
 ```
-'BAP2' u32 W H FPS TOTAL NCHUNK CHUNK_FRAMES
+'BAP3' u32 W H FPS TOTAL NCHUNK CHUNK_FRAMES
 NCHUNK × { u32 comp_off comp_len raw_len frame_first }   # comp_off from blob start
-NCHUNK independent xz streams (LZMA2, 2 MiB dict, CRC32) concatenated
+NCHUNK independent xz streams (LZMA2 9e, 2 MiB dict, data check NONE) concatenated
 ```
 
-Per frame: `u16 (cnt | 0x8000=KEY)`, then per contour: `u8 (k0+64 | 0x80=ABS) u8 (k1+64)` and int16 pairs. Chunks are self-contained (first frame is always KEY), so chunks decode in parallel and `--test` touches only the chunk it needs. Quantization is Q8 (×256): worst-case coefficient error ~0.02 px, an order of magnitude below the 0.54 px FFT-truncation error — measured raster drift vs the float32 build ≤ 0.24 % of cells on the worst frame.
+Per frame: `u16 (cnt | 0x8000=KEY)`, then per contour: `u8 (k0+64 | 0x80=ABS) u8 (k1+64) u8 slot` and int16 pairs. `slot` names a reference slot (0..254): if the slot is live and the record is not ABS, the int16s are a **residual**; otherwise they are absolute values — either way the decoded result is written back into the slot. Slots are keyed by **centroid nearest-neighbor matching + FFT phase/orientation alignment**, so contour reordering between frames no longer poisons residuals. Chunks stay self-contained (first frame is always KEY), so chunks decode in parallel and `--test` touches only the chunk it needs. Quantization is Q8 (×256); harmonics below 0.125 px are zeroed (an order of magnitude below the 0.54 px FFT-truncation error) — the sparsity is what shrinks the blob ~54 % versus BAP2.
 
 `make_blob.py` verifies every chunk by running a decoder mirror over the emitted bytes and asserting value-exact reconstruction before writing anything.
 
@@ -60,7 +60,7 @@ Per frame: `u16 (cnt | 0x8000=KEY)`, then per contour: `u8 (k0+64 | 0x80=ABS) u8
 # 1) video -> per-frame closed contours, Fourier-truncated to k in [-24, 24]
 python3 encode_planb.py my.mp4 badapple.json
 
-# 2) JSON -> BAP2 (quantize + diff + chunked xz, self-verified)
+# 2) JSON -> BAP3 (sparsify + centroid/phase match + slot diff + chunked xz, self-verified)
 python3 make_blob.py badapple.json badapple_blob.bin
 
 # 3) embed & build (or just: make)
