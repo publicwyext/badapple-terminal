@@ -19,7 +19,8 @@
 #   每轮廓: u8 (k0+64 | 0x80=ABS)  u8 (k1+64)  u8 slot (0..254; 0xFF 保留)
 #   i16 x 2*(k1-k0+1)   # 非 ABS 且槽位有效 -> 残差; 否则绝对值 (两种都写回槽位)
 #
-# 用法:  python3 make_blob.py badapple.json badapple_blob.bin
+# 用法:  python3 make_blob.py badapple.json badapple_blob.bin [--zero N]
+#        --zero: 稀疏化清零阈值 (Q8 单位, 默认 32=0.125px; 96=0.375px 约 -39% 体积)
 # 嵌入:  ld -r -b binary -o blob.o badapple_blob.bin
 import json, lzma, struct, sys
 import numpy as np
@@ -204,5 +205,10 @@ def make_blob(in_json, out_bin):
 
 
 if __name__ == '__main__':
-    make_blob(sys.argv[1] if len(sys.argv) > 1 else 'badapple.json',
-              sys.argv[2] if len(sys.argv) > 2 else 'badapple_blob.bin')
+    args = sys.argv[1:]
+    if '--zero' in args:
+        i = args.index('--zero')
+        ZERO = int(args[i + 1])
+        del args[i:i + 2]
+    make_blob(args[0] if args else 'badapple.json',
+              args[1] if len(args) > 1 else 'badapple_blob.bin')
