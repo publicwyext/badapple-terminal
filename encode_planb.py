@@ -69,7 +69,7 @@ def poly_to_coef(pts, n=N_SAMPLES, K=K_HARMONICS):
     cf = C[idx]
     return {"n": n, "k": [-K, K], "c": [[float(v.real), float(v.imag)] for v in cf]}
 
-def encode(in_path, out_json, W=96, H=48, ring=None):
+def encode(in_path, out_json, W=96, H=48):
     proc = subprocess.Popen(
         ['ffmpeg', '-v', 'error', '-i', in_path, '-vf', f'scale={W}:{H}',
          '-pix_fmt', 'gray', '-f', 'rawvideo', '-'],
@@ -85,15 +85,7 @@ def encode(in_path, out_json, W=96, H=48, ring=None):
         if ink.mean() > 0.5:              # 黑主导 -> 黑底白影
             ink = ~ink
             fr["inv"] = True
-        if ring:                          # 舞台相框剜除 (Bad Apple): L,R,T = 左/右/上相框内沿
-            ink[:, :ring[0]] = False
-            ink[:, ring[1]:] = False
-            ink[:ring[2], :] = False
-        loops = trace_loops(ink)
-        if ring:                          # 残留内唇竖线: 近全高但 <3px 宽
-            loops = [p for p in loops
-                     if not (np.ptp(p[:, 1]) > 0.8 * H and np.ptp(p[:, 0]) < 3)]
-        fr["f"] = [poly_to_coef(p) for p in loops]
+        fr["f"] = [poly_to_coef(p) for p in trace_loops(ink)]
         frames.append(fr)
         if len(frames) % 500 == 0:
             print('frame', len(frames), flush=True)
@@ -103,11 +95,5 @@ def encode(in_path, out_json, W=96, H=48, ring=None):
     print('saved', out_json, len(frames), 'frames')
 
 if __name__ == '__main__':
-    args = sys.argv[1:]
-    ring = None
-    if '--ring' in args:
-        i = args.index('--ring')
-        ring = tuple(int(v) for v in args[i + 1].split(','))
-        del args[i:i + 2]
-    encode(args[0] if args else 'badapple.mp4',
-           args[1] if len(args) > 1 else 'badapple.json', ring=ring)
+    encode(sys.argv[1] if len(sys.argv) > 1 else 'badapple.mp4',
+           sys.argv[2] if len(sys.argv) > 2 else 'badapple.json')
