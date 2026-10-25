@@ -2,7 +2,10 @@
 # encode_planb.py — 视频 -> 系数 JSON (无 cv2 依赖)
 # 流程: ffmpeg 抽原始灰度帧 -> Otsu 二值 -> 像素裂缝追踪闭合轮廓 -> 弧长重采样 -> FFT 截断谐波
 # 输出格式: {"w","h","fps","k","frames":[{"f":[{"n":256,"k":[-K,K],"c":[[re,im]*49]}]}]}
-# 用法: python3 encode_planb.py badapple.mp4 badapple.json
+# 用法:
+#   python3 encode_planb.py <video> <out.json>                # 编码
+#   python3 encode_planb.py --sanitize <src.json> <dst.json> [L,R,T]
+#       从系数 JSON 剜除舞台相框环 (852 压制版专用; 真原版 480x360 无框, 不需要)
 import json, subprocess, sys
 import numpy as np
 
@@ -69,6 +72,51 @@ def poly_to_coef(pts, n=N_SAMPLES, K=K_HARMONICS):
     cf = C[idx]
     return {"n": n, "k": [-K, K], "c": [[float(v.real), float(v.imag)] for v in cf]}
 
+def loop_pts(c):
+    """系数 dict -> 256 点闭合折线 (反演, 供手术/自检)"""
+    KS = np.arange(-K_HARMONICS, K_HARMONICS + 1)
+    A = np.zeros(N_SAMPLES, complex)
+    cc = np.array(c['c']).ravel()
+    A[KS % N_SAMPLES] = cc[0::2] + 1j * cc[1::2]
+    z = np.fft.ifft(A) * N_SAMPLES
+    return np.stack([z.real, z.imag], 1)
+
+def sanitize(src, dst, bar=(13, 83, 3), SS=4):
+    """一次性手术: 从系数 JSON 剜掉舞台相框环
+    相框 (左 L 列 / 右 R 列起 / 上 T 行) 随黑白反转换边, 总有一头落进墨里:
+      - 相框单独成环 -> 两侧神秘竖条
+      - 人物贴框时与相框焊成一条环 -> 贴边帧边框复活
+    手法: 受影响帧反演墨图 (SS 超采样栅格化) -> 抹掉环区 -> 重追环 -> 重编码系数;
+    未受影响帧保持原系数不动 (零损伤)"""
+    from PIL import Image, ImageDraw
+    L_BAR, R_BAR, T_BAR = bar
+    d = json.load(open(src))
+    touched = loops_before = loops_after = 0
+    out = []
+    for fi, f in enumerate(d['frames']):
+        polys = [loop_pts(c) for c in f['f']]
+        hit = any(p[:, 0].min() < L_BAR + 0.3 or p[:, 0].max() > R_BAR - 0.3
+                  or p[:, 1].min() < T_BAR + 0.3 for p in polys)
+        if not hit:
+            out.append(f); loops_before += len(polys); loops_after += len(polys)
+            continue
+        touched += 1
+        img = Image.new('L', (d['w'] * SS, d['h'] * SS), 0)
+        dr = ImageDraw.Draw(img)
+        for p in polys:
+            dr.polygon([((x + 0.5) * SS, (y + 0.5) * SS) for x, y in p], fill=255)
+        ink = np.array(img.resize((d['w'], d['h']), Image.BOX), float) >= 127.5
+        ink[:, :L_BAR] = False; ink[:, R_BAR:] = False; ink[:T_BAR, :] = False
+        loops = trace_loops(ink)
+        loops_before += len(polys); loops_after += len(loops)
+        nf = {"f": [poly_to_coef(p) for p in loops]}
+        if f.get("inv"): nf["inv"] = True
+        out.append(nf)
+        if fi % 1000 == 0: print('frame', fi, flush=True)
+    d['frames'] = out
+    json.dump(d, open(dst, 'w'))
+    print(f'touched {touched} frames, loops {loops_before} -> {loops_after}, saved {dst}')
+
 def encode(in_path, out_json, W=96, H=48):
     proc = subprocess.Popen(
         ['ffmpeg', '-v', 'error', '-i', in_path, '-vf', f'scale={W}:{H}',
@@ -95,5 +143,10 @@ def encode(in_path, out_json, W=96, H=48):
     print('saved', out_json, len(frames), 'frames')
 
 if __name__ == '__main__':
-    encode(sys.argv[1] if len(sys.argv) > 1 else 'badapple.mp4',
-           sys.argv[2] if len(sys.argv) > 2 else 'badapple.json')
+    args = sys.argv[1:]
+    if args and args[0] == '--sanitize':
+        bar = tuple(int(v) for v in args[3].split(',')) if len(args) > 3 else (13, 83, 3)
+        sanitize(args[1], args[2], bar)
+    else:
+        encode(args[0] if args else 'badapple.mp4',
+               args[1] if len(args) > 1 else 'badapple.json')
