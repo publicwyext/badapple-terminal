@@ -7,9 +7,18 @@ The coefficient payload ships as a **BAP2 container (~1.3 MB)**: coefficients qu
 ## Build
 
 ```sh
-ld -r -b binary -o blob.o badapple_blob.bin
-gcc -O2 -march=native badapple.c xz_embedded/*.c blob.o -o badapple -lm -lpthread
+make            # -O3 -flto + --gc-sections + strip
 ```
+
+or by hand:
+
+```sh
+ld -r -b binary -o blob.o badapple_blob.bin
+gcc -O3 -march=native -flto -fno-plt -fomit-frame-pointer -ffunction-sections -fdata-sections badapple.c xz_embedded/*.c blob.o -o badapple -lm -lpthread -Wl,--gc-sections,--build-id=none
+strip --strip-all -R .comment -R .note -R .note.gnu.build-id badapple
+```
+
+Note: ~95% of the binary is the already-xz-compressed blob; do NOT UPX-pack the final binary — it saves ~47 KB but doubles startup (11.3 ms → 20.8 ms measured).
 
 ## Usage
 
