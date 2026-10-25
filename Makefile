@@ -1,7 +1,9 @@
 CC      ?= gcc
-CFLAGS  ?= -O3 -march=native -flto -fno-plt -fomit-frame-pointer
+CFLAGS  ?= -O3 -march=native -flto -fno-plt -fomit-frame-pointer \
+           -fno-math-errno -fno-asynchronous-unwind-tables -fno-unwind-tables \
+           -fcf-protection=none -fno-stack-protector -fno-ident
 CFLAGS  += -ffunction-sections -fdata-sections
-LDFLAGS += -Wl,--gc-sections,--build-id=none
+LDFLAGS += -Wl,--gc-sections,--build-id=none -Wl,-z,noseparate-code,-z,norelro
 LDLIBS  += -lm -lpthread
 
 VIDEO   ?=                 # make gen VIDEO=my.mp4

@@ -1,10 +1,14 @@
 /* badapple.c — 傅里叶级数画笔, 终端播放 (C 重写·极致性能版)
  * 数据嵌入: BAP2 容器 (int16 量化 + 帧间差分 + 分块 xz) 由 ld -r -b binary 连入
- * 解压: 内嵌 XZ Embedded (0BSD), 按块流式解码, 多核解码线程池, 块间零依赖可并行
+ * 解压: 内嵌 XZ Embedded (0BSD), 按块流式解码, 多核解码线程池, 块间零依赖可并行;
+ *       refs/raw/xz 实例全部线程本地复用, 稳态解码零分配
  * 渲染: 只用 '#' (ASCII), 画布每格 1 字节
- * 并行: pthread 流水线 — N 个工人按序预烤帧, 解码线程按块前馈, 主线程只差分写 + 节拍休眠
- * 差分: 帧间只输出变化的格子; SIGWINCH 自动适配窗口
- * 用法: ./badapple_c          <-- 数据已在体内
+ * 并行: 默认主线程内联渲染 (单帧仅几十微秒); 画布足够宽 (>= WORKER_COLS 列) 或显式
+ *       --threads N>1 时才启用工人预烤流水线。线程全部 cond 等待, 无轮询。
+ * 差分: 帧间只输出变化的格子; 整帧拼进单缓冲, 一次 write() 落盘 (EINTR/部分写安全);
+ *       光标定位手写 itoa; 同行相邻变化段间隔 < 6 格时并入前段 (定位序列本身 6~10 字节)
+ * 光栅: 16.16 定点 DDA, 每段一次除法, 逐步零 lround
+ * 用法: ./badapple          <-- 数据已在体内 (make gen VIDEO=my.mp4 自带)
  *   可选: --fps F  --threads N  --dthreads N  --cols C  --test K  --selftest
  */
 #define _GNU_SOURCE
@@ -15,6 +19,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <math.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -32,13 +37,16 @@ extern const unsigned char _binary_badapple_blob_bin_end[];
 #define MAXCOEF 98                    /* 2*(24+24+1) */
 #define MAXCT 512                     /* 单帧轮廓数上限 */
 #define NCSLOT 6                      /* 解码块槽位池 */
+#define MERGE_GAP 6                   /* 同行变化段间隔小于此格数则并入前段 */
+#define WORKER_COLS 240               /* 画布达到此宽度才默认启用预烤工人 */
 
 static uint32_t W0, H0, FPS, TOTAL;   /* BAP2 头 */
 static uint32_t NCHUNK, CHUNKF;
 static uint32_t W, H;                 /* 画布尺寸 */
 static double SX, SY;
-static int NTHREAD = 4;
+static int NTHREAD = 0;               /* 0 = 自动: 宽画布才开工人 */
 static int NDEC = 0;                  /* 解码线程, 0=自动 */
+static int g_inline = 1;              /* 主线程内联渲染 */
 static size_t TICK_SZ;
 static volatile sig_atomic_t g_stop = 0;
 
@@ -105,9 +113,9 @@ static void tables_init(void) {
 
 /* h = k0+j 取值 [-64,63], 索引 h+64 ∈ [0,128] 恰好铺满全表 */
 static void decode(const Contour *ct, double *pts) {
+    int K = ct->k1 - ct->k0 + 1;
     float zr[SAMPLES], zi[SAMPLES];
     for (int s = 0; s < SAMPLES; s++) zr[s] = ct->c[0], zi[s] = ct->c[1];
-    int K = ct->k1 - ct->k0 + 1;
     for (int j = 1; j < K; j++) {
         const float *cs = CTab[ct->k0 + j + 64], *sn = STab[ct->k0 + j + 64];
         const float cr = ct->c[2 * j], ci = ct->c[2 * j + 1];
@@ -119,7 +127,7 @@ static void decode(const Contour *ct, double *pts) {
     for (int s = 0; s < SAMPLES; s++) { pts[2 * s] = zr[s]; pts[2 * s + 1] = zi[s]; }
 }
 
-/* ---------- 光栅化 ---------- */
+/* ---------- 光栅化: 16.16 定点 DDA, 每段一次除法, 逐步零 lround ---------- */
 static inline void plot(unsigned char *buf, int x, int y) {
     if (x < 0 || x >= (int)W || y < 0 || y >= (int)H) return;
     buf[(size_t)y * (W + 1) + x] = BLK;
@@ -130,11 +138,15 @@ static void plot_all(const double *pts, int npts, unsigned char *buf) {
     for (int s = 0; s < m; s++) {
         double x0 = pts[2*s] * SX,        y0 = pts[2*s+1] * SY;
         double x1 = pts[2*((s+1)%m)] * SX, y1 = pts[2*((s+1)%m)+1] * SY;
-        int steps = (int)(fmax(fabs(x1-x0), fabs(y1-y0))) + 2;
+        double dx = x1 - x0, dy = y1 - y0;
+        double ax = fabs(dx), ay = fabs(dy);
+        int steps = (int)(ax > ay ? ax : ay) + 2;
+        int64_t xi = llround(x0 * 65536.0), yi = llround(y0 * 65536.0);
+        int64_t xs = llround(dx * 65536.0 / (double)steps);
+        int64_t ys = llround(dy * 65536.0 / (double)steps);
         for (int i = 0; i < steps; i++) {
-            double t = (double)i / steps;
-            int px = (int)lround(x0 + (x1-x0)*t), py = (int)lround(y0 + (y1-y0)*t);
-            plot(buf, px, py);
+            plot(buf, (int)((xi + 32768) >> 16), (int)((yi + 32768) >> 16));
+            xi += xs; yi += ys;
         }
     }
 }
@@ -158,39 +170,78 @@ static void render_frame(long fi, unsigned char *t) {
     }
 }
 
-/* ---------- 差分输出: 只写与上一帧不同的格子 ---------- */
+/* ---------- 差分输出: 整帧单缓冲, 一次 write ---------- */
 static unsigned char *g_prev = NULL;
+static char *emit_buf = NULL;
+static size_t emit_cap = 0;
+
+static void emit_buf_reserve(void) {
+    size_t need = (size_t)H * (W + 32) + 64;
+    if (emit_cap < need) {
+        free(emit_buf);
+        emit_cap = need + need / 2;
+        emit_buf = malloc(emit_cap);
+        if (!emit_buf) { fprintf(stderr, "badapple-c: oom\n"); exit(1); }
+    }
+}
+
+/* SIGWINCH 会打断 write: EINTR 重试, 部分写续传, 绝不输出半截转义序列 */
+static int full_write(int fd, const void *buf, size_t n) {
+    const char *p = buf;
+    while (n) {
+        ssize_t w = write(fd, p, n);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += w; n -= (size_t)w;
+    }
+    return 0;
+}
+
+static inline char *put_u(char *p, uint32_t v) {
+    char t[10]; int n = 0;
+    do { t[n++] = (char)('0' + v % 10u); v /= 10u; } while (v);
+    while (n) *p++ = t[--n];
+    return p;
+}
 
 static void emit_frame(int fd, const unsigned char *cur) {
-    char pre[20];
+    char *p = emit_buf;
     if (!g_prev) {
         g_prev = malloc((size_t)H * (W + 1));
+        if (!g_prev) { fprintf(stderr, "badapple-c: oom\n"); exit(1); }
         memset(g_prev, ' ', (size_t)H * (W + 1));
-        write(fd, "\x1b[2J", 4);
+        memcpy(p, "\x1b[2J", 4); p += 4;
         for (uint32_t r = 0; r < H; r++) {
-            int n = snprintf(pre, sizeof pre, "\x1b[%u;1H", r + 1);
-            write(fd, pre, n);
-            write(fd, cur + (size_t)r * (W + 1), W);
+            p = put_u(p, r + 1); *p++ = ';'; *p++ = '1'; *p++ = 'H';
+            memcpy(p, cur + (size_t)r * (W + 1), W); p += W;
         }
-        write(fd, "\x1b[H", 3);
-        memcpy(g_prev, cur, (size_t)H * (W + 1));
-        return;
-    }
-    for (uint32_t r = 0; r < H; r++) {
-        const unsigned char *a = g_prev + (size_t)r * (W + 1);
-        const unsigned char *b = cur   + (size_t)r * (W + 1);
-        uint32_t c = 0;
-        while (c < W) {
-            while (c < W && a[c] == b[c]) c++;
-            if (c >= W) break;
-            uint32_t c0 = c;
-            while (c < W && a[c] != b[c]) c++;
-            int n = snprintf(pre, sizeof pre, "\x1b[%u;%uH", r + 1, c0 + 1);
-            write(fd, pre, n);
-            write(fd, b + c0, c - c0);
+    } else {
+        for (uint32_t r = 0; r < H; r++) {
+            const unsigned char *a = g_prev + (size_t)r * (W + 1);
+            const unsigned char *b = cur   + (size_t)r * (W + 1);
+            uint32_t c = 0;
+            while (c < W) {
+                while (c < W && a[c] == b[c]) c++;
+                if (c >= W) break;
+                uint32_t c0 = c, c1;
+                for (;;) {
+                    while (c < W && a[c] != b[c]) c++;
+                    c1 = c;
+                    uint32_t gap0 = c;
+                    while (c < W && a[c] == b[c]) c++;
+                    if (c < W && c - gap0 < MERGE_GAP) continue;  /* 小间隙并入前段 */
+                    break;
+                }
+                p = put_u(p, r + 1); *p++ = ';';
+                p = put_u(p, c0 + 1); *p++ = 'H';
+                memcpy(p, b + c0, c1 - c0); p += c1 - c0;
+            }
         }
     }
-    write(fd, "\x1b[H", 3);
+    memcpy(p, "\x1b[H", 3); p += 3;
+    if (full_write(fd, emit_buf, (size_t)(p - emit_buf)) != 0) g_stop = 1;
     memcpy(g_prev, cur, (size_t)H * (W + 1));
 }
 
@@ -199,15 +250,13 @@ typedef struct { int32_t v[MAXCOEF]; int k0, k1, valid; } RefSlot;
 
 static uint32_t get_u32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 
-static int xz_chunk(const ChunkEnt *e, uint8_t *out) {
-    struct xz_dec *s = xz_dec_init(XZ_SINGLE, 0);
-    if (!s) return -1;
+/* xz_dec 单次调用模式自带 reset, 解码器实例可跨块复用 (线程内串行) */
+static int xz_chunk(const ChunkEnt *e, uint8_t *out, struct xz_dec *dec) {
     struct xz_buf b = {
         .in = g_blob + e->off, .in_pos = 0, .in_size = e->clen,
         .out = out, .out_pos = 0, .out_size = e->rlen,
     };
-    enum xz_ret r = xz_dec_run(s, &b);
-    xz_dec_end(s);
+    enum xz_ret r = xz_dec_run(dec, &b);
     return r == XZ_STREAM_END ? 0 : -1;
 }
 
@@ -288,11 +337,7 @@ static void *decoder(void *arg) {
             for (int i = 0; i < NCSLOT; i++)
                 if (cpool[i].state == 0) { s = i; break; }
             if (s >= 0) { c = last_claimed + 1; last_claimed = c; break; }
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_nsec += 50000000;
-            if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-            pthread_cond_timedwait(&cv, &mu, &ts);
+            pthread_cond_wait(&cv, &mu);   /* 谓词每轮重算; 唤醒源: 槽释放/块完成/停止 */
         }
         if (c < 0 || s < 0) { pthread_mutex_unlock(&mu); break; }
         cpool[s].state = 1; cpool[s].chunk = c;
@@ -303,19 +348,32 @@ static void *decoder(void *arg) {
     return NULL;
 }
 
+/* 线程本地刮擦区: refs(~200KB)/raw/xz 实例全复用, 稳态解码零 malloc */
+static __thread RefSlot *t_refs;
+static __thread uint8_t *t_raw;
+static __thread size_t t_rawcap;
+static __thread struct xz_dec *t_xz;
+
 static void decode_chunk_body(long c, CSlot *cs) {
     int fail = 0;
     if (c < cur_chunk) {                       /* resize 跳过的块: 白解, 直接回收 */
         fail = 1;
     } else {
-        uint8_t *raw = malloc(g_chk[c].rlen);
-        fail = !raw || xz_chunk(&g_chk[c], raw) != 0;
-        if (!fail) {
-            RefSlot *refs = calloc(MAXCT, sizeof(RefSlot));
-            fail = !refs || undiff_chunk(raw, (size_t)g_chk[c].rlen, cs, refs) != 0;
-            free(refs);
+        if (!t_refs) {
+            t_refs = calloc(MAXCT, sizeof(RefSlot));
+            if (!t_refs) fail = 1;
         }
-        free(raw);
+        if (!fail && t_rawcap < g_chk[c].rlen) {
+            free(t_raw);
+            t_rawcap = g_chk[c].rlen + g_chk[c].rlen / 4;
+            t_raw = malloc(t_rawcap);
+        }
+        if (!fail && !t_raw) fail = 1;
+        if (!fail && !t_xz) t_xz = xz_dec_init(XZ_SINGLE, 0);
+        if (!fail) {
+            fail = !t_xz || xz_chunk(&g_chk[c], t_raw, t_xz) != 0 ||
+                   undiff_chunk(t_raw, (size_t)g_chk[c].rlen, cs, t_refs) != 0;
+        }
     }
     pthread_mutex_lock(&mu);
     if (fail) {
@@ -343,33 +401,35 @@ static long n_jobs, rd_next = 0;
 static volatile sig_atomic_t g_resize = 0;
 static int g_gen = 0;
 
-/* 带超时的条件等待: 块就绪 + 本槽上一圈已被消费 两个谓词, 轮询兜底
+/* 块就绪 + 本槽上一圈已被消费 两个谓词, 每轮重算
  * 槽位闸门按圈数判定 (rd 越过本槽上一圈 occupant 才许渲染),
  * 旧写法 slot_seq[slot]<=rd 会把"过期标记"误当空闲, 允许跨圈插队踩掉主线程正等的标记 */
 static int wait_worker(long job, int slot, long gen) {
-    struct timespec ts;
     (void)slot;
     for (;;) {
         long s1 = cslot_of[job / CHUNKF];
         int ready = s1 && cpool[s1 - 1].state == 2;
         if (ready && (job < NSLOT || rd_next >= job - (NSLOT - 1))) return 1;
         if (g_stop || g_resize || gen != g_gen) return 0;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 50000000;
-        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-        pthread_cond_timedwait(&cv, &mu, &ts);
+        pthread_cond_wait(&cv, &mu);
     }
 }
 
 static int wait_main(int slot) {
-    struct timespec ts;
     for (;;) {
         if (slot_seq[slot] == rd_next + 1) return 1;
         if (g_stop || g_resize) return 0;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 50000000;
-        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-        pthread_cond_timedwait(&cv, &mu, &ts);
+        pthread_cond_wait(&cv, &mu);
+    }
+}
+
+/* 内联模式: 等目标块就绪 */
+static int wait_chunk_locked(long c) {
+    for (;;) {
+        long s1 = cslot_of[c];
+        if (s1 && cpool[s1 - 1].state == 2) return 1;
+        if (g_stop) return 0;
+        pthread_cond_wait(&cv, &mu);
     }
 }
 
@@ -440,6 +500,7 @@ static void setup_canvas(void) {
     SX = (double)(W - 1) / (W0 - 1);
     SY = (double)(H - 1) / (H0 - 1);
     TICK_SZ = 3 + (size_t)H * (W + 1);
+    emit_buf_reserve();
 }
 
 static void parse_blob(void) {
@@ -469,21 +530,20 @@ static void parse_blob(void) {
 }
 
 int main(int argc, char **argv) {
-    tables_init();
     int test_frame = -1, selftest = 0;
     double fps = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             fprintf(stderr,
-                "badapple_c — 傅里叶级数终端画笔\n"
-                "用法: ./badapple_c [选项]\n"
+                "badapple — 傅里叶级数终端画笔\n"
+                "用法: ./badapple [选项]\n"
                 "  --fps F       播放帧率, 默认 30\n"
-                "  --threads N   渲染线程数, 默认 4\n"
+                "  --threads N   预烤线程数, 默认自动 (画布 >= %d 列才开, 否则内联); 1=强制内联\n"
                 "  --dthreads N  解压线程数, 默认 4\n"
                 "  --cols C      画布列数, 默认 100 (超出终端宽自动收窄)\n"
                 "  --test K      渲染离第 K 帧最近的选中帧后退出\n"
                 "  --selftest    全块串行解压并输出校验和后退出\n"
-                "  -h, --help    显示本帮助\n");
+                "  -h, --help    显示本帮助\n", WORKER_COLS);
             return 0;
         }
         else if (!strcmp(argv[i], "--fps") && i+1 < argc) fps = atof(argv[++i]);
@@ -495,25 +555,35 @@ int main(int argc, char **argv) {
     }
     parse_blob();
     if (!fps) fps = 30;
-    if (NTHREAD < 1) NTHREAD = 1;
+    if (NTHREAD < 0) NTHREAD = 0;
     if (NTHREAD > 64) NTHREAD = 64;
     if (NDEC < 0) NDEC = 0;
     if (NDEC == 0) {
         long onl = sysconf(_SC_NPROCESSORS_ONLN);
         NDEC = onl > 4 ? 4 : (onl < 1 ? 1 : (int)onl);
     }
+    tables_init();
     xz_crc32_init();
 
     setup_canvas();
+    g_inline = (NTHREAD <= 1) || W < WORKER_COLS;
+    if (!g_inline && NTHREAD == 0) NTHREAD = 4;
 
     /* --selftest: 全块串行解压, 输出逐值校验和 */
     if (selftest) {
         RefSlot *refs = calloc(MAXCT, sizeof(RefSlot));
         CSlot cs = {0};
+        struct xz_dec *dec = xz_dec_init(XZ_SINGLE, 0);
+        uint8_t *raw = NULL; size_t rawcap = 0;
         double sum = 0; uint32_t tf = 0, tc = 0;
+        if (!refs || !dec) return 1;
         for (uint32_t c = 0; c < NCHUNK; c++) {
-            uint8_t *raw = malloc(g_chk[c].rlen);
-            if (!raw || xz_chunk(&g_chk[c], raw) != 0 ||
+            if (rawcap < g_chk[c].rlen) {
+                free(raw);
+                rawcap = g_chk[c].rlen + g_chk[c].rlen / 4;
+                raw = malloc(rawcap);
+            }
+            if (!raw || xz_chunk(&g_chk[c], raw, dec) != 0 ||
                 undiff_chunk(raw, g_chk[c].rlen, &cs, refs) != 0) {
                 fprintf(stderr, "selftest: chunk %u failed\n", c);
                 return 1;
@@ -526,22 +596,17 @@ int main(int argc, char **argv) {
                     tc++;
                 }
             tf += cs.nfr;
-            free(raw);
             free_slot_arrays(&cs);
         }
         printf("selftest: %u frames, %u contours, coeff_sum=%.6f\n", tf, tc, sum);
-        free(refs);
+        free(raw); free(refs); xz_dec_end(dec);
         return 0;
     }
 
     long n_sel = TOTAL;
     n_jobs = n_sel;
-    fprintf(stderr, "badapple-c: %ux%u, %ld frames, %u chunks, render=%d decode=%d\n",
-            W, H, n_sel, NCHUNK, NTHREAD, NDEC);
-
-    slot_buf = malloc((size_t)NSLOT * TICK_SZ);
-    for (long s = 0; s < NSLOT; s++)
-        blank_tick(slot_buf + (size_t)s * TICK_SZ);
+    fprintf(stderr, "badapple-c: %ux%u, %ld frames, %u chunks, render=%s decode=%d\n",
+            W, H, n_sel, NCHUNK, g_inline ? "inline" : "worker", NDEC);
 
     /* --test: 同步解目标块, 渲一帧即走 */
     if (test_frame >= 0) {
@@ -554,14 +619,15 @@ int main(int argc, char **argv) {
         long c = bfi / CHUNKF;
         cslot_of[c] = 1;
         cpool[0].state = 2; cpool[0].chunk = c;
+        struct xz_dec *dec = xz_dec_init(XZ_SINGLE, 0);
         uint8_t *raw = malloc(g_chk[c].rlen);
         RefSlot *refs = calloc(MAXCT, sizeof(RefSlot));
-        if (!raw || !refs || xz_chunk(&g_chk[c], raw) != 0 ||
+        if (!raw || !refs || !dec || xz_chunk(&g_chk[c], raw, dec) != 0 ||
             undiff_chunk(raw, g_chk[c].rlen, &cpool[0], refs) != 0) {
             fprintf(stderr, "badapple-c: test chunk decode failed\n");
             return 1;
         }
-        free(raw); free(refs);
+        free(raw); free(refs); xz_dec_end(dec);
         unsigned char *tb = malloc(TICK_SZ);
         render_frame(bfi, tb);
         fwrite(tb + 3, 1, TICK_SZ - 3, stdout);
@@ -573,10 +639,21 @@ int main(int argc, char **argv) {
     pthread_t th[64], dth[16];
     if (NDEC > 16) NDEC = 16;
     for (int i = 0; i < NDEC; i++) pthread_create(&dth[i], NULL, decoder, NULL);
-    for (int i = 0; i < NTHREAD; i++) pthread_create(&th[i], NULL, worker, NULL);
 
     int fd = 1;
-    write(fd, "\x1b[?25l\x1b[2J", 7);
+    full_write(fd, "\x1b[?25l\x1b[2J", 7);
+    unsigned char *tick = NULL;
+
+    if (!g_inline) {
+        slot_buf = malloc((size_t)NSLOT * TICK_SZ);
+        for (long s = 0; s < NSLOT; s++)
+            blank_tick(slot_buf + (size_t)s * TICK_SZ);
+        for (int i = 0; i < NTHREAD; i++) pthread_create(&th[i], NULL, worker, NULL);
+    } else {
+        tick = malloc(TICK_SZ);
+        blank_tick(tick);
+    }
+
     struct timespec ts;
     double beat = 1.0 / fps, next = 0;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -586,38 +663,61 @@ int main(int argc, char **argv) {
             g_resize = 0;
             usleep(150000);
             if (g_resize) continue;
-            pthread_mutex_lock(&mu);
-            g_gen++;
-            rd_next = atomic_load(&job_next);
-            memset(slot_seq, 0, sizeof slot_seq);
-            release_passed_chunks_locked();
-            pthread_cond_broadcast(&cv);
-            pthread_mutex_unlock(&mu);
-            for (int i = 0; i < NTHREAD; i++) pthread_join(th[i], NULL);
-            free(g_prev); g_prev = NULL;
-            setup_canvas();
-            free(slot_buf);
-            slot_buf = malloc((size_t)NSLOT * TICK_SZ);
-            for (long s = 0; s < NSLOT; s++)
-                blank_tick(slot_buf + (size_t)s * TICK_SZ);
-            write(fd, "\x1b[2J", 4);
+            if (g_inline) {
+                /* 内联: 帧是现渲的, 只需换画布重画; 解码槽与几何无关 */
+                free(g_prev); g_prev = NULL;
+                setup_canvas();
+                free(tick);
+                tick = malloc(TICK_SZ);
+                blank_tick(tick);
+                full_write(fd, "\x1b[2J", 4);
+            } else {
+                pthread_mutex_lock(&mu);
+                g_gen++;
+                rd_next = atomic_load(&job_next);
+                memset(slot_seq, 0, sizeof slot_seq);
+                release_passed_chunks_locked();
+                pthread_cond_broadcast(&cv);
+                pthread_mutex_unlock(&mu);
+                for (int i = 0; i < NTHREAD; i++) pthread_join(th[i], NULL);
+                free(g_prev); g_prev = NULL;
+                setup_canvas();
+                free(slot_buf);
+                slot_buf = malloc((size_t)NSLOT * TICK_SZ);
+                for (long s = 0; s < NSLOT; s++)
+                    blank_tick(slot_buf + (size_t)s * TICK_SZ);
+                full_write(fd, "\x1b[2J", 4);
+                for (int i = 0; i < NTHREAD; i++) pthread_create(&th[i], NULL, worker, NULL);
+            }
             fprintf(stderr, "badapple-c: resize -> %ux%u\n", W, H);
-            for (int i = 0; i < NTHREAD; i++) pthread_create(&th[i], NULL, worker, NULL);
             if (rd_next >= n_jobs) break;
             next = -1;
         }
-        int slot = (int)(rd_next % NSLOT);
-        pthread_mutex_lock(&mu);
-        int ok = wait_main(slot);
-        pthread_mutex_unlock(&mu);
-        if (!ok) continue;
-        unsigned char *tb = slot_buf + (size_t)slot * TICK_SZ;
-        emit_frame(fd, tb + 3);
-        rd_next++;
-        pthread_mutex_lock(&mu);
-        release_passed_chunks_locked();
-        pthread_cond_broadcast(&cv);
-        pthread_mutex_unlock(&mu);
+        if (g_inline) {
+            long c = rd_next / CHUNKF;
+            pthread_mutex_lock(&mu);
+            release_passed_chunks_locked();
+            int ok = wait_chunk_locked(c);
+            pthread_cond_broadcast(&cv);
+            pthread_mutex_unlock(&mu);
+            if (!ok) break;
+            render_frame(rd_next, tick);
+            emit_frame(fd, tick + 3);
+            rd_next++;
+        } else {
+            int slot = (int)(rd_next % NSLOT);
+            pthread_mutex_lock(&mu);
+            int ok = wait_main(slot);
+            pthread_mutex_unlock(&mu);
+            if (!ok) continue;
+            unsigned char *tb = slot_buf + (size_t)slot * TICK_SZ;
+            emit_frame(fd, tb + 3);
+            rd_next++;
+            pthread_mutex_lock(&mu);
+            release_passed_chunks_locked();
+            pthread_cond_broadcast(&cv);
+            pthread_mutex_unlock(&mu);
+        }
         next += beat;
         clock_gettime(CLOCK_MONOTONIC, &ts);
         double now = ts.tv_sec + ts.tv_nsec * 1e-9;
@@ -625,14 +725,13 @@ int main(int argc, char **argv) {
             ts.tv_sec = (time_t)next;
             ts.tv_nsec = (long)((next - ts.tv_sec) * 1e9);
             clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL);
-        } else if (next < 0) {
-            next = now;
         } else {
             next = now;
         }
     }
-    write(fd, "\x1b[?25h\n", 7);
-    for (int i = 0; i < NTHREAD; i++) pthread_join(th[i], NULL);
+    full_write(fd, "\x1b[?25h\n", 7);
+    if (!g_inline)
+        for (int i = 0; i < NTHREAD; i++) pthread_join(th[i], NULL);
     g_stop = 1;
     pthread_mutex_lock(&mu);
     pthread_cond_broadcast(&cv);
