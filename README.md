@@ -46,7 +46,11 @@ On resize, stale-size frames are dropped by advancing the read cursor; chunks fu
 'BAP3' u32 W H FPS TOTAL NCHUNK CHUNK_FRAMES
 NCHUNK × { u32 comp_off comp_len raw_len frame_first }   # comp_off from blob start
 NCHUNK independent xz streams (LZMA2 9e, 2 MiB dict, data check NONE) concatenated
+[optional audio tail] MP3 bytes + u32 le mp3_len + 'BAUD'
 ```
+
+The optional audio tail is appended by `make gen` (ffmpeg → mono 16 kHz 16 kbps MP3 ≈ 429 KB for the 3'39" song). The player locates it from the end marker, starts playback on the same `CLOCK_MONOTONIC` beat as the first frame, and falls back to silent if there is no tail, no sound device, or the build is `make NO_AUDIO=1`. Decode/playback is vendored single-header `miniaudio.h` (dr_mp3 + device I/O, zero external deps); `--test` never opens a device.
+
 
 Per frame: `u16 (cnt | 0x8000=KEY)`, then per contour: `u8 (k0+64 | 0x80=ABS) u8 (k1+64) u8 slot` and int16 pairs. `slot` names a reference slot (0..254): if the slot is live and the record is not ABS, the int16s are a **residual**; otherwise they are absolute values — either way the decoded result is written back into the slot. Slots are keyed by **centroid nearest-neighbor matching + FFT phase/orientation alignment**, so contour reordering between frames no longer poisons residuals. Chunks stay self-contained (first frame is always KEY), so chunks decode in parallel and `--test` touches only the chunk it needs. Quantization is Q8 (×256); harmonics below 0.125 px are zeroed (an order of magnitude below the 0.54 px FFT-truncation error) — the sparsity is what shrinks the blob ~54 % versus BAP2.
 

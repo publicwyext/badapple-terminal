@@ -4,18 +4,24 @@ CFLAGS  ?= -O3 -march=native -flto -fno-plt -fomit-frame-pointer \
            -fcf-protection=none -fno-stack-protector -fno-ident
 CFLAGS  += -ffunction-sections -fdata-sections
 LDFLAGS += -Wl,--gc-sections,--build-id=none -Wl,-z,noseparate-code,-z,norelro
-LDLIBS  += -lm -lpthread
+LDLIBS  += -lm -lpthread -ldl
 
 VIDEO   ?=                 # make gen VIDEO=my.mp4
 
 XZ_SRC := $(wildcard xz_embedded/*.c)
 
+ifeq ($(NO_AUDIO),1)
+CFLAGS += -DNO_AUDIO
+endif
+
 all: badapple
 
-# bring-your-own-video: video -> contour JSON -> BAP2 blob -> blob.o
+# bring-your-own-video: video -> contour JSON -> BAP3 blob (+MP3 audio tail) -> blob.o
 ifneq ($(VIDEO),)
-blob.o: badapple.json
-	python3 make_blob.py $< badapple_blob.bin
+ba_aud.mp3: $(VIDEO)
+	ffmpeg -y -v error -i $< -vn -ac 1 -ar 16000 -b:a 16k $@
+blob.o: badapple.json ba_aud.mp3
+	python3 make_blob.py $< badapple_blob.bin --audio ba_aud.mp3
 	ld -r -b binary -o $@ badapple_blob.bin
 
 badapple.json: $(VIDEO)
@@ -26,12 +32,15 @@ blob.o: badapple_blob.bin
 	ld -r -b binary -o $@ $<
 endif
 
-badapple: badapple.c $(XZ_SRC) blob.o
-	$(CC) $(CFLAGS) badapple.c $(XZ_SRC) blob.o -o $@ $(LDFLAGS) $(LDLIBS)
+audio_impl.o: audio_impl.c miniaudio.h audio.h
+	$(CC) $(subst -O3,-Os,$(CFLAGS)) -c audio_impl.c -o $@
+
+badapple: badapple.c audio.h $(XZ_SRC) blob.o audio_impl.o
+	$(CC) $(CFLAGS) badapple.c audio_impl.c $(XZ_SRC) blob.o -o $@ $(LDFLAGS) $(LDLIBS)
 	strip --strip-all -R .comment -R .note -R .note.gnu.build-id $@
 
 clean:
-	rm -f badapple blob.o badapple_blob.bin badapple.json
+	rm -f badapple blob.o badapple_blob.bin badapple.json ba_aud.mp3 audio_impl.o
 
 .PHONY: all clean gen
 gen: all

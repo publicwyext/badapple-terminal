@@ -148,7 +148,7 @@ def undiff(chunk):
     return frames
 
 
-def make_blob(in_json, out_bin, sy=1.0):
+def make_blob(in_json, out_bin, sy=1.0, audio=None):
     d = json.load(open(in_json))
     frames = d['frames']
     if sy != 1.0:   # y 仿射: c'_k = Re(c_k) + i*sy*Im(c_k); 域高同步缩放 (DFT 线性性, 逐值无损)
@@ -204,6 +204,10 @@ def make_blob(in_json, out_bin, sy=1.0):
 
     blob = b'BAP3' + struct.pack('<6I', d['w'], d['h'], d['fps'], total,
                                  len(chunks), CHUNK_FRAMES) + bytes(table) + b''.join(streams)
+    if audio:
+        ab = open(audio, 'rb').read()
+        blob += ab + struct.pack('<I', len(ab)) + b'BAUD'
+        print(f'audio: {len(ab)} bytes appended')
     open(out_bin, 'wb').write(blob)
     raw = sum(len(c) for c in chunks)
     print(f'{out_bin}: {len(blob)} bytes (raw {raw}, x{raw/len(blob):.1f}), '
@@ -217,5 +221,6 @@ if __name__ == '__main__':
     ap.add_argument('out_bin', nargs='?', default='badapple_blob.bin')
     ap.add_argument('--sy', type=float, default=1.0,
                     help='y 轴仿射拉伸 (修纵横比: 480x360 被 scale=96:48 压扁时用 1.5)')
+    ap.add_argument('--audio', default=None, help='追加 MP3 音频 (尾部 BAUD trailer)')
     a = ap.parse_args()
-    make_blob(a.in_json, a.out_bin, sy=a.sy)
+    make_blob(a.in_json, a.out_bin, sy=a.sy, audio=a.audio)

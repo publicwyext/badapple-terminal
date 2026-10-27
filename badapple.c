@@ -27,6 +27,7 @@
 #include <signal.h>
 #include <sys/ioctl.h>
 #include "xz_embedded/xz.h"
+#include "audio.h"
 
 extern const unsigned char _binary_badapple_blob_bin_start[];
 extern const unsigned char _binary_badapple_blob_bin_end[];
@@ -57,6 +58,8 @@ typedef struct { Contour *ct; int nct; } Frame;
 
 static const uint8_t *g_blob;
 static size_t g_blob_len;
+static const uint8_t *g_aud;
+static size_t g_aud_n;
 typedef struct { uint32_t off, clen, rlen, first; } ChunkEnt;
 static ChunkEnt *g_chk;
 
@@ -534,6 +537,14 @@ static void parse_blob(void) {
     }
     cslot_of = calloc(NCHUNK, sizeof(long));
     if (!cslot_of) exit(1);
+    /* 尾部音频: [mp3][u32 n]'BAUD' */
+    if (g_blob_len > 8 && !memcmp(g_blob + g_blob_len - 4, "BAUD", 4)) {
+        uint32_t n = get_u32(g_blob + g_blob_len - 8);
+        if (n && (size_t)n + 8 <= g_blob_len) {
+            g_aud = g_blob + g_blob_len - 8 - n;
+            g_aud_n = n;
+        }
+    }
 }
 
 int main(int argc, char **argv) {
@@ -614,8 +625,10 @@ int main(int argc, char **argv) {
 
     long n_sel = TOTAL;
     n_jobs = n_sel;
-    fprintf(stderr, "badapple-c: %ux%u, %ld frames, %u chunks, render=%s decode=%d\n",
-            W, H, n_sel, NCHUNK, g_inline ? "inline" : "worker", NDEC);
+    int a_on = test_frame < 0 ? aud_start(g_aud, g_aud_n) : 0;
+    fprintf(stderr, "badapple-c: %ux%u, %ld frames, %u chunks, render=%s decode=%d audio=%uKB%s\n",
+            W, H, n_sel, NCHUNK, g_inline ? "inline" : "worker", NDEC,
+            (unsigned)(g_aud_n / 1024), a_on ? "" : " (silent)");
 
     /* --test: 同步解目标块, 渲一帧即走 */
     if (test_frame >= 0) {
@@ -739,6 +752,7 @@ int main(int argc, char **argv) {
         }
     }
     full_write(fd, "\x1b[?25h\n", 7);
+    aud_stop();
     if (!g_inline)
         for (int i = 0; i < NTHREAD; i++) pthread_join(th[i], NULL);
     g_stop = 1;
