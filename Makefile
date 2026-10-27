@@ -42,5 +42,32 @@ badapple: badapple.c audio.h $(XZ_SRC) blob.o audio_impl.o
 clean:
 	rm -f badapple blob.o badapple_blob.bin badapple.json ba_aud.mp3 audio_impl.o
 
-.PHONY: all clean gen
+# ---- cross builds: badapple-x86_64 / badapple-aarch64 (make cross) ----
+# x86_64 needs -march=x86-64-v2 (cross gcc has no -march=native); aarch64 keeps it
+CFLAGS_X86     := $(filter-out -march=native,$(CFLAGS)) -march=x86-64-v2
+CFLAGS_AARCH64 := $(CFLAGS)
+
+define CROSS_RULE
+badapple-$(1): badapple.c audio.h $$(XZ_SRC) blob-$(1).o audio-$(1).o
+	$$(TRIPLE_$(1))-gcc $$(CFLAGS_$(2)) badapple.c audio_impl.c $$(XZ_SRC) blob-$(1).o -o $$@ $$(LDFLAGS) $$(LDLIBS)
+	$$(TRIPLE_$(1))-strip --strip-all -R .comment -R .note -R .note.gnu.build-id $$@
+
+blob-$(1).o: badapple_blob.bin
+	$$(TRIPLE_$(1))-ld -r -b binary -o $$@ $$<
+
+audio-$(1).o: audio_impl.c miniaudio.h audio.h
+	$$(TRIPLE_$(1))-gcc $$(subst -O3,-Os,$$(CFLAGS_$(2))) -c audio_impl.c -o $$@
+endef
+
+TRIPLE_x86_64  := x86_64-linux-gnu
+TRIPLE_aarch64 := aarch64-linux-gnu
+$(eval $(call CROSS_RULE,x86_64,X86))
+$(eval $(call CROSS_RULE,aarch64,AARCH64))
+
+cross: badapple-x86_64 badapple-aarch64
+	@readelf -h badapple-x86_64  | grep -q 'Machine:.*X86-64'  || { echo "FATAL: x86_64 build is not x86-64"; file badapple-x86_64; exit 1; }
+	@readelf -h badapple-aarch64 | grep -q 'Machine:.*AArch64' || { echo "FATAL: aarch64 build is not aarch64"; file badapple-aarch64; exit 1; }
+	@file badapple-x86_64 badapple-aarch64 | sed 's/, BuildID[^,]*//'
+
+.PHONY: all clean gen cross
 gen: all
