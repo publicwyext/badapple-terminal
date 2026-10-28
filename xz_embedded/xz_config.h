@@ -13,6 +13,9 @@
 #include "xz.h"
 
 #define GFP_KERNEL 0
+#ifndef __always_inline
+#define __always_inline inline __attribute__((always_inline))
+#endif
 static inline void *kmalloc(size_t n, int gfp) { (void)gfp; return malloc(n); }
 static inline void *vzalloc(size_t n) { return calloc(1, n); }
 static inline void kfree(void *p) { free(p); }

@@ -15,6 +15,16 @@ make                     # rebuild later without re-encoding
 
 The one-liner runs the full pipeline — `encode_planb.py` (ffmpeg raw gray → Otsu → pixel-crack contour tracing → arc-length resample → FFT truncated to k ∈ [-24, 24]) then `make_blob.py` (quantize + inter-frame diff + chunked xz, decoder-mirror self-verified) — then embeds the blob and builds with `-O3 -flto + --gc-sections + strip`.
 
+### Windows
+
+Windows 10 1809+ (ANSI/VT console required). `make win` cross-compiles a fully static `badapple.exe` — only `KERNEL32.dll` + `msvcrt.dll` imports, nothing to install; the target verifies the artifact is really `PE32+ x86-64` and copies it to `badapple-windows-x86_64.exe`.
+
+```sh
+make win                 # needs gcc-mingw-w64-x86-64 (apt) or MSYS2 mingw-w64-x86_64-gcc
+```
+
+Port notes: clocks/pthreads come from winpthreads (`clock_gettime`/`clock_nanosleep` keep POSIX semantics); `win_compat.h` supplies VT enabling, console size (`GetConsoleScreenBufferInfo` instead of `TIOCGWINSZ`), a per-frame resize poll (Windows has no SIGWINCH) and `write`/`usleep`/`sysconf` shims. Resize is honored every frame instead of via signal.
+
 ## Usage
 
 ```sh

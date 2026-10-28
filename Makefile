@@ -69,5 +69,29 @@ cross: badapple-x86_64 badapple-aarch64
 	@readelf -h badapple-aarch64 | grep -q 'Machine:.*AArch64' || { echo "FATAL: aarch64 build is not aarch64"; file badapple-aarch64; exit 1; }
 	@file badapple-x86_64 badapple-aarch64 | sed 's/, BuildID[^,]*//'
 
-.PHONY: all clean gen cross
+.PHONY: all clean gen cross win clean-win
 gen: all
+
+# ---- Windows cross build: badapple.exe (make win; needs gcc-mingw-w64-x86-64) ----
+# Targets Windows 10 1809+ (ANSI/VT console). Fully static — no MinGW runtime
+# DLLs. Clocks/pthreads come from winpthreads; audio is miniaudio WASAPI.
+TRIPLE_WIN := x86_64-w64-mingw32
+CFLAGS_WIN := -O3 -ffunction-sections -fdata-sections \
+              -fno-asynchronous-unwind-tables -fno-unwind-tables \
+              -fno-stack-protector -fno-ident -D_WIN32_WINNT=0x0A00
+LDLIBS_WIN := -static -lwinpthread -lole32 -lwinmm -lm
+
+win: badapple.exe
+	@file badapple.exe | grep -q 'PE32+.*x86-64' || { echo "FATAL: badapple.exe is not Windows x86-64"; file badapple.exe; exit 1; }
+	@cp badapple.exe badapple-windows-x86_64.exe
+	@file badapple-windows-x86_64.exe | sed 's/, stripped[^,]*//'
+
+blob-win.o: badapple_blob.bin
+	$(TRIPLE_WIN)-ld -r -b binary -o $@ $<
+
+badapple.exe: badapple.c win_compat.h audio.h $(XZ_SRC) blob-win.o audio_impl.c miniaudio.h
+	$(TRIPLE_WIN)-gcc $(CFLAGS_WIN) badapple.c audio_impl.c $(XZ_SRC) blob-win.o -o $@ -Wl,--gc-sections $(LDLIBS_WIN)
+	$(TRIPLE_WIN)-strip --strip-all $@
+
+clean-win:
+	rm -f badapple.exe blob-win.o

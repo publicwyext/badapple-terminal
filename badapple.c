@@ -17,15 +17,19 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <math.h>
 #include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
 #include <signal.h>
+#ifdef _WIN32
+#include "win_compat.h"     /* console VT/size/resize; clocks via winpthreads */
+#else
+#include <unistd.h>
+#include <fcntl.h>
 #include <sys/ioctl.h>
+#endif
 #include "xz_embedded/xz.h"
 #include "audio.h"
 
@@ -483,14 +487,29 @@ static void *worker(void *arg) {
 }
 
 static void on_sigint(int s) { (void)s; g_stop = 1; }
+#ifndef _WIN32
 static void on_sigwinch(int s) { (void)s; g_resize = 1; }
+#endif
+
+/* cross-platform terminal size; either output may be NULL */
+static void query_termsize(int *cols, int *rows) {
+#ifdef _WIN32
+    win_term_size(cols, rows);
+#else
+    struct winsize ws;
+    if (ioctl(1, TIOCGWINSZ, &ws) == 0) {
+        if (cols) *cols = (int)ws.ws_col;
+        if (rows) *rows = (int)ws.ws_row;
+    }
+#endif
+}
 
 static int cols_opt = 0;
 static void setup_canvas(void) {
     int cols = cols_opt;
     if (!cols) {
-        struct winsize ws;
-        int term = (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 1) ? (int)ws.ws_col : 0;
+        int term = 0;
+        query_termsize(&term, NULL);
         cols = 100;
         if (term > 1 && cols > term - 1) cols = term - 1;
     }
@@ -498,9 +517,9 @@ static void setup_canvas(void) {
     H = (uint32_t)lround((double)W * H0 / (2.0 * W0));
     if (H < 8) H = 8;
     {
-        struct winsize ws;
-        int rows = (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 4) ? ws.ws_row : 30;
-        if ((int)H > rows - 3) {
+        int rows = 0;
+        query_termsize(NULL, &rows);
+        if (rows > 4 && (int)H > rows - 3) {
             H = rows - 3;
             uint32_t w2 = (uint32_t)lround(2.0 * H * W0 / (double)H0);
             if (w2 < W) W = w2;
@@ -657,7 +676,9 @@ int main(int argc, char **argv) {
     }
 
     signal(SIGINT, on_sigint);
+#ifndef _WIN32
     signal(SIGWINCH, on_sigwinch);
+#endif
     pthread_t th[64], dth[16];
     if (NDEC > 16) NDEC = 16;
     for (int i = 0; i < NDEC; i++) pthread_create(&dth[i], NULL, decoder, NULL);
@@ -681,6 +702,9 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     next = ts.tv_sec + ts.tv_nsec * 1e-9;
     while (!g_stop && rd_next < n_jobs) {
+#ifdef _WIN32
+        if (win_poll_resize()) g_resize = 1;   /* no SIGWINCH: poll per frame */
+#endif
         if (g_resize) {
             g_resize = 0;
             usleep(150000);
