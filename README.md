@@ -23,7 +23,7 @@ Windows 10 1809+ (ANSI/VT console required). `make win` cross-compiles a fully s
 make win                 # needs gcc-mingw-w64-x86-64 (apt) or MSYS2 mingw-w64-x86_64-gcc
 ```
 
-Port notes: clocks/pthreads come from winpthreads (`clock_gettime`/`clock_nanosleep` keep POSIX semantics); `win_compat.h` supplies VT enabling, console size (`GetConsoleScreenBufferInfo` instead of `TIOCGWINSZ`), a per-frame resize poll (Windows has no SIGWINCH) and `write`/`usleep`/`sysconf` shims. Resize is honored every frame instead of via signal.
+Port notes: clocks/pthreads come from winpthreads (`clock_gettime`/`clock_nanosleep` keep POSIX semantics); a shim inlined in `src/badapple.c` under `#ifdef _WIN32` supplies VT enabling, console size (`GetConsoleScreenBufferInfo` instead of `TIOCGWINSZ`), a per-frame resize poll (Windows has no SIGWINCH) and `write`/`usleep`/`sysconf` shims. Resize is honored every frame instead of via signal.
 
 ## Usage
 
@@ -79,7 +79,7 @@ python3 make_blob.py badapple.json badapple_blob.bin
 
 # 3) embed & build (or just: make)
 ld -r -b binary -o blob.o badapple_blob.bin
-gcc -O3 -march=native -flto -fno-plt -fomit-frame-pointer -ffunction-sections -fdata-sections badapple.c xz_embedded/*.c blob.o -o badapple -lm -lpthread -Wl,--gc-sections,--build-id=none
+gcc -O3 -march=native -flto -fno-plt -fomit-frame-pointer -ffunction-sections -fdata-sections src/badapple.c src/xz_embedded/*.c blob.o -o badapple -lm -lpthread -Wl,--gc-sections,--build-id=none
 strip --strip-all -R .comment -R .note -R .note.gnu.build-id badapple
 ```
 
@@ -87,4 +87,4 @@ Note: ~95% of the binary is the already-xz-compressed blob; do NOT UPX-pack the 
 
 How it works: ffmpeg pumps raw gray frames → Otsu threshold → **pixel-crack contour tracing** (closed loops, saddle-point safe) → arc-length resampling to 256 points → `np.fft` truncated to 49 harmonics per contour. Playback resynthesizes each outline with `z(t) = Σ c_k e^{2πikt}` — that's the epicycle.
 
-Repo files: `badapple.c` (renderer + streaming decoder) · `encode_planb.py` / `make_blob.py` (generation pipeline) · `Makefile` (BYO video one-liner) · `xz_embedded/` (vendored XZ Embedded, 0BSD). No pre-baked blob ships here — encode your own.
+Repo files: `src/badapple.c` (renderer + streaming decoder, Windows shim inlined) · `src/audio*.c/h`, `src/miniaudio.h` (audio) · `src/xz_embedded/` (vendored XZ Embedded, 0BSD) · `encode_planb.py` / `make_blob.py` (generation pipeline) · `Makefile` (BYO video one-liner). No pre-baked blob ships here — encode your own.

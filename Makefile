@@ -8,7 +8,7 @@ LDLIBS  += -lm -lpthread -ldl
 
 VIDEO   ?=                 # make gen VIDEO=my.mp4
 
-XZ_SRC := $(wildcard xz_embedded/*.c)
+XZ_SRC := $(wildcard src/xz_embedded/*.c)
 
 ifeq ($(NO_AUDIO),1)
 CFLAGS += -DNO_AUDIO
@@ -32,11 +32,11 @@ blob.o: badapple_blob.bin
 	ld -r -b binary -o $@ $<
 endif
 
-audio_impl.o: audio_impl.c miniaudio.h audio.h
-	$(CC) $(subst -O3,-Os,$(CFLAGS)) -c audio_impl.c -o $@
+audio_impl.o: src/audio_impl.c src/miniaudio.h src/audio.h
+	$(CC) $(subst -O3,-Os,$(CFLAGS)) -c src/audio_impl.c -o $@
 
-badapple: badapple.c audio.h $(XZ_SRC) blob.o audio_impl.o
-	$(CC) $(CFLAGS) badapple.c audio_impl.c $(XZ_SRC) blob.o -o $@ $(LDFLAGS) $(LDLIBS)
+badapple: src/badapple.c src/audio.h $(XZ_SRC) blob.o audio_impl.o
+	$(CC) $(CFLAGS) src/badapple.c src/audio_impl.c $(XZ_SRC) blob.o -o $@ $(LDFLAGS) $(LDLIBS)
 	strip --strip-all -R .comment -R .note -R .note.gnu.build-id $@
 
 clean:
@@ -48,15 +48,15 @@ CFLAGS_X86     := $(filter-out -march=native,$(CFLAGS)) -march=x86-64-v2
 CFLAGS_AARCH64 := $(CFLAGS)
 
 define CROSS_RULE
-badapple-$(1): badapple.c audio.h $$(XZ_SRC) blob-$(1).o audio-$(1).o
-	$$(TRIPLE_$(1))-gcc $$(CFLAGS_$(2)) badapple.c audio_impl.c $$(XZ_SRC) blob-$(1).o -o $$@ $$(LDFLAGS) $$(LDLIBS)
+badapple-$(1): src/badapple.c src/audio.h $$(XZ_SRC) blob-$(1).o audio-$(1).o
+	$$(TRIPLE_$(1))-gcc $$(CFLAGS_$(2)) src/badapple.c src/audio_impl.c $$(XZ_SRC) blob-$(1).o -o $$@ $$(LDFLAGS) $$(LDLIBS)
 	$$(TRIPLE_$(1))-strip --strip-all -R .comment -R .note -R .note.gnu.build-id $$@
 
 blob-$(1).o: badapple_blob.bin
 	$$(TRIPLE_$(1))-ld -r -b binary -o $$@ $$<
 
-audio-$(1).o: audio_impl.c miniaudio.h audio.h
-	$$(TRIPLE_$(1))-gcc $$(subst -O3,-Os,$$(CFLAGS_$(2))) -c audio_impl.c -o $$@
+audio-$(1).o: src/audio_impl.c src/miniaudio.h src/audio.h
+	$$(TRIPLE_$(1))-gcc $$(subst -O3,-Os,$$(CFLAGS_$(2))) -c src/audio_impl.c -o $$@
 endef
 
 TRIPLE_x86_64  := x86_64-linux-gnu
@@ -89,8 +89,8 @@ win: badapple.exe
 blob-win.o: badapple_blob.bin
 	$(TRIPLE_WIN)-ld -r -b binary -o $@ $<
 
-badapple.exe: badapple.c win_compat.h audio.h $(XZ_SRC) blob-win.o audio_impl.c miniaudio.h
-	$(TRIPLE_WIN)-gcc $(CFLAGS_WIN) badapple.c audio_impl.c $(XZ_SRC) blob-win.o -o $@ -Wl,--gc-sections $(LDLIBS_WIN)
+badapple.exe: src/badapple.c src/audio.h $(XZ_SRC) blob-win.o src/audio_impl.c src/miniaudio.h
+	$(TRIPLE_WIN)-gcc $(CFLAGS_WIN) src/badapple.c src/audio_impl.c $(XZ_SRC) blob-win.o -o $@ -Wl,--gc-sections $(LDLIBS_WIN)
 	$(TRIPLE_WIN)-strip --strip-all $@
 
 clean-win:
