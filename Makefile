@@ -2,13 +2,13 @@ CC      ?= gcc
 CFLAGS  ?= -O3 -march=native -flto -fno-plt -fomit-frame-pointer \
            -fno-math-errno -fno-asynchronous-unwind-tables -fno-unwind-tables \
            -fcf-protection=none -fno-stack-protector -fno-ident
-CFLAGS  += -ffunction-sections -fdata-sections
+CFLAGS  += -ffunction-sections -fdata-sections -Iinclude
 LDFLAGS += -Wl,--gc-sections,--build-id=none -Wl,-z,noseparate-code,-z,norelro
 LDLIBS  += -lm -lpthread -ldl
 
 VIDEO   ?=                 # make gen VIDEO=my.mp4
 
-XZ_SRC := $(wildcard src/xz_embedded/*.c)
+XZ_SRC := $(wildcard include/xz_embedded/*.c)
 
 ifeq ($(NO_AUDIO),1)
 CFLAGS += -DNO_AUDIO
@@ -32,11 +32,11 @@ blob.o: badapple_blob.bin
 	ld -r -b binary -o $@ $<
 endif
 
-audio_impl.o: src/audio_impl.c src/miniaudio.h src/audio.h
-	$(CC) $(subst -O3,-Os,$(CFLAGS)) -c src/audio_impl.c -o $@
+audio_impl.o: include/audio_impl.c include/miniaudio.h include/audio.h
+	$(CC) $(subst -O3,-Os,$(CFLAGS)) -c include/audio_impl.c -o $@
 
-badapple: src/badapple.c src/audio.h $(XZ_SRC) blob.o audio_impl.o
-	$(CC) $(CFLAGS) src/badapple.c src/audio_impl.c $(XZ_SRC) blob.o -o $@ $(LDFLAGS) $(LDLIBS)
+badapple: src/badapple.c include/audio.h $(XZ_SRC) blob.o audio_impl.o
+	$(CC) $(CFLAGS) src/badapple.c include/audio_impl.c $(XZ_SRC) blob.o -o $@ $(LDFLAGS) $(LDLIBS)
 	strip --strip-all -R .comment -R .note -R .note.gnu.build-id $@
 
 clean:
@@ -48,15 +48,15 @@ CFLAGS_X86     := $(filter-out -march=native,$(CFLAGS)) -march=x86-64-v2
 CFLAGS_AARCH64 := $(CFLAGS)
 
 define CROSS_RULE
-badapple-$(1): src/badapple.c src/audio.h $$(XZ_SRC) blob-$(1).o audio-$(1).o
-	$$(TRIPLE_$(1))-gcc $$(CFLAGS_$(2)) src/badapple.c src/audio_impl.c $$(XZ_SRC) blob-$(1).o -o $$@ $$(LDFLAGS) $$(LDLIBS)
+badapple-$(1): src/badapple.c include/audio.h $$(XZ_SRC) blob-$(1).o audio-$(1).o
+	$$(TRIPLE_$(1))-gcc $$(CFLAGS_$(2)) src/badapple.c include/audio_impl.c $$(XZ_SRC) blob-$(1).o -o $$@ $$(LDFLAGS) $$(LDLIBS)
 	$$(TRIPLE_$(1))-strip --strip-all -R .comment -R .note -R .note.gnu.build-id $$@
 
 blob-$(1).o: badapple_blob.bin
 	$$(TRIPLE_$(1))-ld -r -b binary -o $$@ $$<
 
-audio-$(1).o: src/audio_impl.c src/miniaudio.h src/audio.h
-	$$(TRIPLE_$(1))-gcc $$(subst -O3,-Os,$$(CFLAGS_$(2))) -c src/audio_impl.c -o $$@
+audio-$(1).o: include/audio_impl.c include/miniaudio.h include/audio.h
+	$$(TRIPLE_$(1))-gcc $$(subst -O3,-Os,$$(CFLAGS_$(2))) -c include/audio_impl.c -o $$@
 endef
 
 TRIPLE_x86_64  := x86_64-linux-gnu
@@ -76,7 +76,7 @@ gen: all
 # Targets Windows 10 1809+ (ANSI/VT console). Fully static — no MinGW runtime
 # DLLs. Clocks/pthreads come from winpthreads; audio is miniaudio WASAPI.
 TRIPLE_WIN := x86_64-w64-mingw32
-CFLAGS_WIN := -O3 -ffunction-sections -fdata-sections \
+CFLAGS_WIN := -Iinclude -O3 -ffunction-sections -fdata-sections \
               -fno-asynchronous-unwind-tables -fno-unwind-tables \
               -fno-stack-protector -fno-ident -D_WIN32_WINNT=0x0A00
 LDLIBS_WIN := -static -lwinpthread -lole32 -lwinmm -lm
@@ -89,8 +89,8 @@ win: badapple.exe
 blob-win.o: badapple_blob.bin
 	$(TRIPLE_WIN)-ld -r -b binary -o $@ $<
 
-badapple.exe: src/badapple.c src/audio.h $(XZ_SRC) blob-win.o src/audio_impl.c src/miniaudio.h
-	$(TRIPLE_WIN)-gcc $(CFLAGS_WIN) src/badapple.c src/audio_impl.c $(XZ_SRC) blob-win.o -o $@ -Wl,--gc-sections $(LDLIBS_WIN)
+badapple.exe: src/badapple.c include/audio.h $(XZ_SRC) blob-win.o include/audio_impl.c include/miniaudio.h
+	$(TRIPLE_WIN)-gcc $(CFLAGS_WIN) src/badapple.c include/audio_impl.c $(XZ_SRC) blob-win.o -o $@ -Wl,--gc-sections $(LDLIBS_WIN)
 	$(TRIPLE_WIN)-strip --strip-all $@
 
 clean-win:

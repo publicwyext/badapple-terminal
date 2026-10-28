@@ -79,7 +79,7 @@ python3 make_blob.py badapple.json badapple_blob.bin
 
 # 3) embed & build (or just: make)
 ld -r -b binary -o blob.o badapple_blob.bin
-gcc -O3 -march=native -flto -fno-plt -fomit-frame-pointer -ffunction-sections -fdata-sections src/badapple.c src/xz_embedded/*.c blob.o -o badapple -lm -lpthread -Wl,--gc-sections,--build-id=none
+gcc -O3 -march=native -flto -fno-plt -fomit-frame-pointer -ffunction-sections -fdata-sections -Iinclude src/badapple.c include/xz_embedded/*.c blob.o -o badapple -lm -lpthread -Wl,--gc-sections,--build-id=none
 strip --strip-all -R .comment -R .note -R .note.gnu.build-id badapple
 ```
 
@@ -87,4 +87,4 @@ Note: ~95% of the binary is the already-xz-compressed blob; do NOT UPX-pack the 
 
 How it works: ffmpeg pumps raw gray frames → Otsu threshold → **pixel-crack contour tracing** (closed loops, saddle-point safe) → arc-length resampling to 256 points → `np.fft` truncated to 49 harmonics per contour. Playback resynthesizes each outline with `z(t) = Σ c_k e^{2πikt}` — that's the epicycle.
 
-Repo files: `src/badapple.c` (renderer + streaming decoder, Windows shim inlined) · `src/audio*.c/h`, `src/miniaudio.h` (audio) · `src/xz_embedded/` (vendored XZ Embedded, 0BSD) · `encode_planb.py` / `make_blob.py` (generation pipeline) · `Makefile` (BYO video one-liner). No pre-baked blob ships here — encode your own.
+Repo files: `src/badapple.c` (renderer + streaming decoder, Windows shim inlined) · `include/audio*.c/h`, `include/miniaudio.h` (audio) · `include/xz_embedded/` (vendored XZ Embedded, 0BSD) · `encode_planb.py` / `make_blob.py` (generation pipeline) · `Makefile` (BYO video one-liner). No pre-baked blob ships here — encode your own.
