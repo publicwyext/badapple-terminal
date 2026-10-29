@@ -57,7 +57,10 @@ static void win_enable_vt(void) {
 #ifdef __GNUC__
 __attribute__((constructor))
 #endif
-static void win_vt_ctor(void) { win_enable_vt(); }
+static void win_vt_ctor(void) {
+    win_enable_vt();
+    SetConsoleOutputCP(CP_UTF8); /* █/提示文本为 UTF-8 字面, 否则 GBK 控制台乱码 */
+}
 
 /* visible window size (not the scrollback buffer) */
 static int win_term_size(int *cols, int *rows) {
